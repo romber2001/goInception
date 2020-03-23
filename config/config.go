@@ -16,11 +16,14 @@ package config
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"strings"
+
 	// "fmt"
 	"io/ioutil"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/util/logutil"
 	"github.com/pingcap/errors"
 	tracing "github.com/uber/jaeger-client-go/config"
@@ -329,8 +332,14 @@ type Inc struct {
 	GeneralLog bool `toml:"general_log" json:"general_log"`
 	// 使用十六进制表示法转储二进制列
 	// 受影响的数据类型为BINARY，VARBINARY，BLOB类型
-	HexBlob bool   `toml:"hex_blob" json:"hex_blob"`
-	Lang    string `toml:"lang" json:"lang"`
+	HexBlob bool `toml:"hex_blob" json:"hex_blob"`
+
+	// 表名/索引名前缀，为空时不作限制
+	IndexPrefix     string `toml:"index_prefix" json:"index_prefix"`
+	UniqIndexPrefix string `toml:"uniq_index_prefix" json:"uniq_index_prefix"`
+	TablePrefix     string `toml:"table_prefix" json:"table_prefix"`
+
+	Lang string `toml:"lang" json:"lang"`
 	// 连接服务器允许的最大包大小,以字节为单位 默认值为4194304(即4MB)
 	MaxAllowedPacket uint `toml:"max_allowed_packet" json:"max_allowed_packet"`
 	MaxCharLength    uint `toml:"max_char_length" json:"max_char_length"`
@@ -373,6 +382,9 @@ type Inc struct {
 	SupportEngine string `toml:"support_engine" json:"support_engine"`
 	// 远端数据库等待超时时间，单位:秒
 	WaitTimeout int `toml:"wait_timeout" json:"wait_timeout"`
+
+	// 版本信息
+	Version string `toml:"version" json:"version"`
 }
 
 // Osc online schema change 工具参数配置
@@ -406,6 +418,9 @@ type Osc struct {
 
 	// 对应参数pt-online-schema-change中的参数--max-lag。默认值：3
 	OscMaxLag int `toml:"osc_max_lag" json:"osc_max_lag"`
+
+	// 类似--max-lag，检查集群暂停流量控制所花费的平均时间（仅适用于PXC 5.6及以上版本）
+	OscMaxFlowCtl int `toml:"osc_max_flow_ctl" json:"osc_max_flow_ctl"`
 
 	// 对应参数pt-online-schema-change中的参数--[no]check-alter。默认值：ON
 	OscCheckAlter bool `toml:"osc_check_alter" json:"osc_check_alter"`
@@ -588,7 +603,6 @@ type IncLevel struct {
 	ER_AUTO_INCR_ID_WARNING         int8 `toml:"er_auto_incr_id_warning"`
 	ER_AUTOINC_UNSIGNED             int8 `toml:"er_autoinc_unsigned"`
 	ER_BLOB_CANT_HAVE_DEFAULT       int8 `toml:"er_blob_cant_have_default"`
-	ErCantChangeColumn              int8 `toml:"er_cant_change_column"`
 	ER_CANT_SET_CHARSET             int8 `toml:"er_cant_set_charset"`
 	ER_CANT_SET_COLLATION           int8 `toml:"er_cant_set_collation"`
 	ER_CANT_SET_ENGINE              int8 `toml:"er_cant_set_engine"`
@@ -619,6 +633,7 @@ type IncLevel struct {
 	ER_TABLE_CHARSET_MUST_UTF8      int8 `toml:"er_table_charset_must_utf8"`
 	ER_TABLE_MUST_HAVE_COMMENT      int8 `toml:"er_table_must_have_comment"`
 	ER_TABLE_MUST_HAVE_PK           int8 `toml:"er_table_must_have_pk"`
+	ER_TABLE_PREFIX                 int8 `toml:"er_table_prefix"`
 	ER_TEXT_NOT_NULLABLE_ERROR      int8 `toml:"er_text_not_nullable_error"`
 	ER_TIMESTAMP_DEFAULT            int8 `toml:"er_timestamp_default"`
 	ER_TOO_MANY_KEY_PARTS           int8 `toml:"er_too_many_key_parts"`
@@ -632,11 +647,12 @@ type IncLevel struct {
 	ER_WITH_INSERT_FIELD            int8 `toml:"er_with_insert_field"`
 	ER_WITH_LIMIT_CONDITION         int8 `toml:"er_with_limit_condition"`
 	ER_WITH_ORDERBY_CONDITION       int8 `toml:"er_with_orderby_condition"`
-	ErrWrongAndExpr                 int8 `toml:"er_wrong_and_expr"`
+	ErCantChangeColumn              int8 `toml:"er_cant_change_column"`
 	ErCantChangeColumnPosition      int8 `toml:"er_cant_change_column_position"`
 	ErJsonTypeSupport               int8 `toml:"er_json_type_support"`
-	ErrJoinNoOnCondition            int8 `toml:"er_join_no_on_condition"`
 	ErrImplicitTypeConversion       int8 `toml:"er_implicit_type_conversion"`
+	ErrJoinNoOnCondition            int8 `toml:"er_join_no_on_condition"`
+	ErrWrongAndExpr                 int8 `toml:"er_wrong_and_expr"`
 }
 
 var defaultConf = Config{
@@ -744,7 +760,13 @@ var defaultConf = Config{
 
 		// 为配置方便,在config节点也添加相同参数
 		SkipGrantTable: true,
-		// Version:            &mysql.TiDBReleaseVersion,
+
+		// 默认参数不指定,避免test时失败
+		// Version:            mysql.TiDBReleaseVersion,
+
+		IndexPrefix:     "idx_",  // 默认不检查,由CheckIndexPrefix控制
+		UniqIndexPrefix: "uniq_", // 默认不检查,由CheckIndexPrefix控制
+		TablePrefix:     "",      // 默认不检查表前缀
 	},
 	Osc: Osc{
 		OscPrintNone:               false,
@@ -754,6 +776,7 @@ var defaultConf = Config{
 		OscAlterForeignKeysMethod:  "none",
 		OscRecursionMethod:         "processlist",
 		OscMaxLag:                  3,
+		OscMaxFlowCtl:              -1,
 		OscCheckAlter:              true,
 		OscCheckReplicationFilters: true,
 		OscCheckUniqueKeyChange:    true,
@@ -791,7 +814,6 @@ var defaultConf = Config{
 		ER_AUTO_INCR_ID_WARNING:         1,
 		ER_AUTOINC_UNSIGNED:             1,
 		ER_BLOB_CANT_HAVE_DEFAULT:       1,
-		ErCantChangeColumn:              1,
 		ER_CANT_SET_CHARSET:             1,
 		ER_CANT_SET_COLLATION:           1,
 		ER_CANT_SET_ENGINE:              1,
@@ -811,7 +833,6 @@ var defaultConf = Config{
 		ER_INVALID_IDENT:                1,
 		ER_MUST_HAVE_COLUMNS:            1,
 		ER_NO_WHERE_CONDITION:           1,
-		ErrJoinNoOnCondition:            1,
 		ER_NOT_ALLOWED_NULLABLE:         1,
 		ER_ORDERY_BY_RAND:               1,
 		ER_PARTITION_NOT_ALLOWED:        1,
@@ -823,6 +844,7 @@ var defaultConf = Config{
 		ER_TABLE_CHARSET_MUST_UTF8:      1,
 		ER_TABLE_MUST_HAVE_COMMENT:      1,
 		ER_TABLE_MUST_HAVE_PK:           1,
+		ER_TABLE_PREFIX:                 1,
 		ER_TEXT_NOT_NULLABLE_ERROR:      1,
 		ER_TIMESTAMP_DEFAULT:            1,
 		ER_TOO_MANY_KEY_PARTS:           1,
@@ -836,10 +858,12 @@ var defaultConf = Config{
 		ER_WITH_INSERT_FIELD:            1,
 		ER_WITH_LIMIT_CONDITION:         1,
 		ER_WITH_ORDERBY_CONDITION:       1,
-		ErrWrongAndExpr:                 1,
+		ErCantChangeColumn:              1,
 		ErCantChangeColumnPosition:      1,
 		ErJsonTypeSupport:               2,
 		ErrImplicitTypeConversion:       1,
+		ErrJoinNoOnCondition:            1,
+		ErrWrongAndExpr:                 1,
 	},
 }
 
@@ -855,6 +879,8 @@ func NewConfig() *Config {
 // It should store configuration from command line and configuration file.
 // Other parts of the system can read the global configuration use this function.
 func GetGlobalConfig() *Config {
+	// 自动设置版本号
+	globalConf.Inc.Version = strings.TrimRight(mysql.TiDBReleaseVersion, "-dirty")
 	return &globalConf
 }
 

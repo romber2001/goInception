@@ -54,6 +54,11 @@ check_column_comment = false
 # 审核列类型变更
 check_column_type_change = true
 
+# 表名/索引名前缀
+index_prefix = "idx_"
+uniq_index_prefix = "uniq_"
+table_prefix = ""
+
 # explain判断受影响行数时使用的规则, 默认值"first"
 # 可选值: "first", "max"
 #      "first":    使用第一行的explain结果作为受影响行数
@@ -104,6 +109,9 @@ osc_recursion_method = "processlist"
 
 # 对应参数pt-online-schema-change中的参数--max-lag。默认值：3
 osc_max_lag = 3
+
+# 类似--max-lag，检查集群暂停流量控制所花费的平均时间（仅适用于PXC 5.6及以上版本,会自动检测)
+osc_max_flow_ctl = -1
 
 # 对应参数pt-online-schema-change中的参数--[no]check-alter。默认值：ON
 osc_check_alter = true
@@ -202,6 +210,7 @@ er_table_charset_must_null = 1
 er_table_charset_must_utf8 = 1
 er_table_must_have_comment = 1
 er_table_must_have_pk = 1
+er_table_prefix = 1
 er_text_not_nullable_error = 1
 er_timestamp_default = 1
 er_too_many_key_parts = 1

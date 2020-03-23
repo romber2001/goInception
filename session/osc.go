@@ -35,17 +35,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	// "github.com/hanchuanchuan/goInception/ast"
-	// "github.com/hanchuanchuan/goInception/server"
-	"github.com/hanchuanchuan/goInception/config"
+	"github.com/hanchuanchuan/goInception/ast"
+	"github.com/hanchuanchuan/goInception/format"
 	"github.com/hanchuanchuan/goInception/util"
 	"github.com/hanchuanchuan/goInception/util/auth"
 
-	// "github.com/pingcap/errors"
-
-	"github.com/github/gh-ost/go/base"
-	"github.com/github/gh-ost/go/logic"
-	ghostlog "github.com/outbrain/golib/log"
+	"github.com/hanchuanchuan/gh-ost/go/base"
+	"github.com/hanchuanchuan/gh-ost/go/logic"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -171,6 +167,11 @@ func (s *session) mysqlExecuteAlterTableOsc(r *Record) {
 	buf.WriteString(" --statistics ")
 	buf.WriteString(" --max-lag=")
 	buf.WriteString(fmt.Sprintf("%d", s.Osc.OscMaxLag))
+
+	if s.IsClusterNode && s.DBVersion > 50600 && s.Osc.OscMaxFlowCtl >= 0 {
+		buf.WriteString(" --max-flow-ctl=")
+		buf.WriteString(fmt.Sprintf("%d", s.Osc.OscMaxFlowCtl))
+	}
 
 	buf.WriteString(" --no-version-check ")
 	buf.WriteString(" --recursion-method=")
@@ -411,7 +412,7 @@ func (s *session) mysqlExecuteAlterTableGhost(r *Record) {
 			log.Error("--test-on-replica-skip-replica-stop requires --test-on-replica to be enabled")
 			s.AppendErrorMessage("--test-on-replica-skip-replica-stop requires --test-on-replica to be enabled")
 		}
-		ghostlog.Warning("--test-on-replica-skip-replica-stop enabled. We will not stop replication before cut-over. Ensure you have a plugin that does this.")
+		log.Warning("--test-on-replica-skip-replica-stop enabled. We will not stop replication before cut-over. Ensure you have a plugin that does this.")
 	}
 	if migrationContext.CliMasterUser != "" && migrationContext.AssumeMasterHostname == "" {
 		log.Error("--master-user requires --assume-master-host")
@@ -430,7 +431,7 @@ func (s *session) mysqlExecuteAlterTableGhost(r *Record) {
 		s.AppendErrorMessage("--ssl-allow-insecure requires --ssl")
 	}
 	if replicationLagQuery != "" {
-		ghostlog.Warningf("--replication-lag-query is deprecated")
+		log.Warningf("--replication-lag-query is deprecated")
 	}
 
 	switch cutOver {
@@ -568,13 +569,14 @@ func (s *session) mysqlExecuteAlterTableGhost(r *Record) {
 
 	go f(bufio.NewReader(migrator.Log))
 
-	if config.GetGlobalConfig().Log.Level == "debug" ||
-		config.GetGlobalConfig().Log.Level == "info" {
-		ghostlog.SetLevel(ghostlog.INFO)
-	} else {
-		ghostlog.SetLevel(ghostlog.ERROR)
-	}
+	// if config.GetGlobalConfig().Log.Level == "debug" ||
+	// 	config.GetGlobalConfig().Log.Level == "info" {
+	// 	ghostlog.SetLevel(ghostlog.INFO)
+	// } else {
+	// 	ghostlog.SetLevel(ghostlog.ERROR)
+	// }
 
+	// ghostlog.SetOutput(log.StandardLogger().Out)
 	// ghostlog.SetLevel(ghostlog.DEBUG)
 
 	if err := migrator.Migrate(); err != nil {
@@ -754,76 +756,152 @@ func (s *session) mysqlAnalyzeGhostOutput(out string, p *util.OscProcessInfo) {
 
 func (s *session) getAlterTablePostPart(sql string, isPtOSC bool) string {
 
-	var buf []string
-	for _, line := range strings.Split(sql, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-- ") || strings.HasPrefix(line, "/*") {
-			continue
-		}
-		buf = append(buf, line)
-	}
-	sql = strings.Join(buf, "\n")
-	index := strings.Index(strings.ToUpper(sql), "ALTER")
-	if index == -1 {
-		s.AppendErrorMessage("无效alter语句!")
-		return sql
+	sql = strings.Replace(sql, "\\", "\\\\", -1)
+	part, ok := s.getAlterPartSql(sql)
+	if !ok {
+		return ""
 	}
 
-	sql = sql[index:]
-
-	parts := strings.Fields(sql)
-	if len(parts) < 4 {
-		s.AppendErrorMessage("无效alter语句!")
-		return sql
-	}
-
-	supportOper := []string{
-		"add",
-		"algorithm",
-		"alter",
-		"auto_increment",
-		"avg_row_length",
-		"change",
-		"character",
-		"checksum",
-		"comment",
-		"convert",
-		"collate",
-		"default",
-		"disable",
-		"discard",
-		"drop",
-		"enable",
-		"engine",
-		"force",
-		"import",
-		"modify",
-		"rename", // rename index
-	}
-
-	support := false
-	for _, p := range supportOper {
-		// if strings.ToLower(parts[3]) == p {
-		if strings.HasPrefix(strings.ToLower(parts[3]), p) {
-			support = true
-			break
-		}
-	}
-	if !support {
-		s.AppendErrorMessage(fmt.Sprintf("不支持的osc操作!(%s)", sql))
-		return sql
-	}
-
-	sql = strings.Join(parts[3:], " ")
-
-	sql = strings.Replace(sql, "\"", "\\\"", -1)
+	// 解析后的语句长度不能小于解析前!
+	// sqlParts := strings.Fields(sql)
+	// if len(sqlParts) >= 4 {
+	// 	newSql := strings.Join(sqlParts[3:], " ")
+	// 	if len(part) < len(newSql) &&
+	// 		!strings.Contains(part, "UNIQUE") {
+	// 		log.Errorf("origin sql: %s", sql)
+	// 		log.Errorf("parsed after: %s", part)
+	// 		s.AppendErrorMessage("alter子句解析失败,请联系作者或自行调整!")
+	// 		return ""
+	// 	}
+	// }
 
 	// gh-ost不需要处理`,pt-osc需要处理
 	if isPtOSC {
-		sql = strings.Replace(sql, "`", "\\`", -1)
+		part = strings.Replace(part, "\"", "\\\"", -1)
+		part = strings.Replace(part, "`", "\\`", -1)
+		part = strings.Replace(part, "$", "\\$", -1)
 	}
 
-	return sql
+	return part
+
+	// var buf []string
+	// for _, line := range strings.Split(sql, "\n") {
+	// 	line = strings.TrimSpace(line)
+	// 	if strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-- ") || strings.HasPrefix(line, "/*") {
+	// 		continue
+	// 	}
+	// 	buf = append(buf, line)
+	// }
+	// sql = strings.Join(buf, "\n")
+	// index := strings.Index(strings.ToUpper(sql), "ALTER")
+	// if index == -1 {
+	// 	s.AppendErrorMessage("无效alter语句!")
+	// 	return sql
+	// }
+
+	// sql = sql[index:]
+
+	// parts := strings.Fields(sql)
+	// if len(parts) < 4 {
+	// 	s.AppendErrorMessage("无效alter语句!")
+	// 	return sql
+	// }
+
+	// supportOper := []string{
+	// 	"add",
+	// 	"algorithm",
+	// 	"alter",
+	// 	"auto_increment",
+	// 	"avg_row_length",
+	// 	"change",
+	// 	"character",
+	// 	"checksum",
+	// 	"comment",
+	// 	"convert",
+	// 	"collate",
+	// 	"default",
+	// 	"disable",
+	// 	"discard",
+	// 	"drop",
+	// 	"enable",
+	// 	"engine",
+	// 	"force",
+	// 	"import",
+	// 	"modify",
+	// 	"rename", // rename index
+	// }
+
+	// support := false
+	// for _, p := range supportOper {
+	// 	// if strings.ToLower(parts[3]) == p {
+	// 	if strings.HasPrefix(strings.ToLower(parts[3]), p) {
+	// 		support = true
+	// 		break
+	// 	}
+	// }
+	// if !support {
+	// 	s.AppendErrorMessage(fmt.Sprintf("不支持的osc操作!(%s)", sql))
+	// 	return sql
+	// }
+
+	// sql = strings.Join(parts[3:], " ")
+
+	// sql = strings.Replace(sql, "\"", "\\\"", -1)
+
+	// // gh-ost不需要处理`,pt-osc需要处理
+	// if isPtOSC {
+	// 	sql = strings.Replace(sql, "`", "\\`", -1)
+	// }
+
+	// return sql
+}
+
+// getAlterPartSql 获取alter子句部分
+func (s *session) getAlterPartSql(sql string) (string, bool) {
+	// sql = strings.Replace(sql, "\n", " ", -1)
+	// sql = strings.Replace(sql, "\r", " ", -1)
+
+	charsetInfo, collation := s.sessionVars.GetCharsetInfo()
+	stmtNodes, _, err := s.parser.Parse(sql, charsetInfo, collation)
+	if err != nil {
+		s.AppendErrorMessage(err.Error())
+		return "", false
+	}
+	var builder strings.Builder
+	var columns []string
+
+	if len(stmtNodes) == 0 {
+		s.AppendErrorMessage(fmt.Sprintf("未正确解析ALTER语句: %s", sql))
+		log.Error(fmt.Sprintf("未正确解析ALTER语句: %s", sql))
+		return "", false
+	}
+
+	for _, stmtNode := range stmtNodes {
+
+		switch node := stmtNode.(type) {
+		case *ast.AlterTableStmt:
+			for _, alter := range node.Specs {
+				builder.Reset()
+				err = alter.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &builder))
+				if err != nil {
+					s.AppendErrorMessage(err.Error())
+					return "", false
+				}
+				restoreSQL := builder.String()
+				columns = append(columns, restoreSQL)
+			}
+		default:
+			s.AppendErrorMessage(fmt.Sprintf("无效类型: %v", stmtNode))
+			return "", false
+		}
+	}
+
+	if len(columns) > 0 {
+		return strings.Join(columns, ", "), true
+	}
+
+	s.AppendErrorMessage(fmt.Sprintf("未正确解析SQL: %s", sql))
+	return "", false
 }
 
 // truncateString: 根据指定长度做字符串截断,长度溢出时转换为hash值以避免重复

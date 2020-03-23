@@ -39,11 +39,13 @@ func (s *testSessionIncExecSuite) SetUpSuite(c *C) {
 
 	s.initSetUp(c)
 
-	inc := &config.GetGlobalConfig().Inc
+	inc := &s.defaultInc
 
 	inc.EnableFingerprint = true
 	inc.SqlSafeUpdates = 0
 	inc.EnableDropTable = true
+
+	config.GetGlobalConfig().Osc.OscMaxFlowCtl = 1
 }
 
 func (s *testSessionIncExecSuite) TearDownSuite(c *C) {
@@ -51,10 +53,11 @@ func (s *testSessionIncExecSuite) TearDownSuite(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TearDownTest(c *C) {
+	s.reset()
 	s.tearDownTest(c)
 }
 
-func (s *testSessionIncExecSuite) testErrorCode(c *C, sql string, errors ...*session.SQLError) {
+func (s *testSessionIncExecSuite) testErrorCode(c *C, sql string, errors ...*session.SQLError) [][]interface{} {
 	if s.tk == nil {
 		s.tk = testkit.NewTestKitWithInit(c, s.store)
 	}
@@ -82,22 +85,19 @@ func (s *testSessionIncExecSuite) testErrorCode(c *C, sql string, errors ...*ses
 		c.Assert(row[4], Equals, strings.Join(errMsgs, "\n"), Commentf("%v", row))
 	}
 
-	c.Assert(row[2], Equals, strconv.Itoa(errCode), Commentf("%v", row))
+	c.Assert(row[2], Equals, strconv.Itoa(errCode), Commentf("%v", res.Rows()))
 	// 无错误时需要校验结果是否标记为已执行
 	if errCode == 0 {
-		if !strings.Contains(row[3].(string), "Execute Successfully") {
-			fmt.Println(res.Rows())
+		c.Assert(strings.Contains(row[3].(string), "Execute Successfully"), Equals, true, Commentf("%v", res.Rows()))
+		for _, row := range res.Rows() {
+			c.Assert(row[2], Not(Equals), "2", Commentf("%v", res.Rows()))
 		}
-		c.Assert(strings.Contains(row[3].(string), "Execute Successfully"), Equals, true)
-		// c.Assert(row[4].(string), IsNil)
 	}
+
+	return res.Rows()
 }
 
 func (s *testSessionIncExecSuite) TestCreateTable(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	sql := ""
 
@@ -356,10 +356,6 @@ primary key(id)) comment 'test';`
 }
 
 func (s *testSessionIncExecSuite) TestDropTable(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	config.GetGlobalConfig().Inc.EnableDropTable = false
 	sql := ""
@@ -375,10 +371,6 @@ func (s *testSessionIncExecSuite) TestDropTable(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestAlterTableAddColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
@@ -468,10 +460,20 @@ func (s *testSessionIncExecSuite) TestAlterTableAddColumn(c *C) {
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 
 	// 无效默认值
-	res = s.runExec("drop table if exists t1;create table t1(id int);alter table t1 add column c1 int default '';")
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
-	c.Assert(row[2], Equals, "2")
-	c.Assert(row[4], Equals, "Invalid default value for column 'c1'.")
+	config.GetGlobalConfig().Inc.EnableEnumSetBit = true
+	sql = "drop table if exists t1;create table t1(id int primary key);alter table t1 add column c1 bit default '0';"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DEFAULT, "c1"))
+
+	sql = "drop table if exists t1;create table t1(id int primary key);alter table t1 add column c1 bit default b'0';"
+	// pt-osc
+	config.GetGlobalConfig().Osc.OscOn = true
+	s.mustRunExec(c, sql)
+
+	// gh-ost
+	config.GetGlobalConfig().Osc.OscOn = false
+	config.GetGlobalConfig().Ghost.GhostOn = true
+	s.mustRunExec(c, sql)
 
 	// blob/text字段
 	config.GetGlobalConfig().Inc.EnableBlobType = false
@@ -553,10 +555,6 @@ func (s *testSessionIncExecSuite) TestAlterTableAddColumn(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestAlterTableAlterColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	res := s.runExec("drop table if exists t1;create table t1(id int);alter table t1 alter column id set default '';")
 	row := res.Rows()[int(s.tk.Se.AffectedRows())-1]
@@ -575,10 +573,6 @@ func (s *testSessionIncExecSuite) TestAlterTableAlterColumn(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestAlterTableModifyColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
@@ -606,20 +600,18 @@ func (s *testSessionIncExecSuite) TestAlterTableModifyColumn(c *C) {
 	c.Assert(row[4], Equals, "Column 't1.id1' not existed.")
 
 	// 数据类型 警告
-	res = s.runExec("drop table if exists t1;create table t1(id bit);alter table t1 modify column id bit;")
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
-	c.Assert(row[2], Equals, "1")
-	c.Assert(row[4], Equals, "Not supported data type on field: 'id'.")
+	config.GetGlobalConfig().Inc.EnableEnumSetBit = false
+	sql = "drop table if exists t1;create table t1(id bit);alter table t1 modify column id bit;"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DATA_TYPE, "id"))
 
-	res = s.runExec("drop table if exists t1;create table t1(id enum('red', 'blue'));alter table t1 modify column id enum('red', 'blue', 'black');")
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
-	c.Assert(row[2], Equals, "1")
-	c.Assert(row[4], Equals, "Not supported data type on field: 'id'.")
+	sql = "drop table if exists t1;create table t1(id enum('red', 'blue'));alter table t1 modify column id enum('red', 'blue', 'black');"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DATA_TYPE, "id"))
 
 	res = s.runExec("drop table if exists t1;create table t1(id set('red'));alter table t1 modify column id set('red', 'blue', 'black');")
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
-	c.Assert(row[2], Equals, "1")
-	c.Assert(row[4], Equals, "Not supported data type on field: 'id'.")
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DATA_TYPE, "id"))
 
 	// char列建议
 	config.GetGlobalConfig().Inc.MaxCharLength = 100
@@ -706,10 +698,6 @@ func (s *testSessionIncExecSuite) TestAlterTableModifyColumn(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestAlterTableDropColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 	sql := ""
 
 	res := s.runExec("drop table if exists t1;create table t1(id int,c1 int);alter table t1 drop column c2;")
@@ -732,10 +720,6 @@ func (s *testSessionIncExecSuite) TestAlterTableDropColumn(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestInsert(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	config.GetGlobalConfig().Inc.CheckInsertField = false
 	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
@@ -846,10 +830,6 @@ func (s *testSessionIncExecSuite) TestInsert(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestUpdate(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	config.GetGlobalConfig().Inc.CheckInsertField = false
 	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
@@ -1031,17 +1011,16 @@ func (s *testSessionIncExecSuite) TestDelete(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestCreateDataBase(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
-	config.GetGlobalConfig().Inc.EnableDropDatabase = true
+	inc := &config.GetGlobalConfig().Inc
+	inc.EnableDropDatabase = true
 
 	sql := ""
 
 	sql = "drop database if exists test1111111111111111111;create database if not exists test1111111111111111111;"
 	s.testErrorCode(c, sql)
+
+	dbname := fmt.Sprintf("%s_%d_%s", strings.ReplaceAll(inc.BackupHost, ".", "_"), inc.BackupPort, "test_inc")
+	s.testErrorCode(c, fmt.Sprintf("drop database if exists %s;", dbname))
 
 	// 存在
 	sql = "create database test1111111111111111111;create database test1111111111111111111;"
@@ -1072,6 +1051,9 @@ func (s *testSessionIncExecSuite) TestCreateDataBase(c *C) {
 	sql = "create database mysql"
 	s.testErrorCode(c, sql,
 		session.NewErrf("数据库'%s'已存在.", "mysql"))
+
+	sql = "drop database if exists test1111111111111111111;"
+	s.mustRunExec(c, sql)
 
 	// 字符集
 	config.GetGlobalConfig().Inc.EnableSetCharset = false
@@ -1120,10 +1102,6 @@ func (s *testSessionIncExecSuite) TestCreateView(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestAlterTableAddIndex(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
@@ -1142,11 +1120,6 @@ func (s *testSessionIncExecSuite) TestAlterTableAddIndex(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestAlterTableDropIndex(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
 	sql := ""
@@ -1234,27 +1207,150 @@ func (s *testSessionIncExecSuite) TestSetVariables(c *C) {
 }
 
 func (s *testSessionIncExecSuite) TestAlterTable(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
 	config.GetGlobalConfig().Inc.EnableDropTable = true
 	sql := ""
+
+	sql = "drop table if exists t1;create table t1(id int auto_increment primary key,c1 int);"
+	s.mustRunExec(c, sql)
+
 	// 删除后添加列
-	sql = "drop table if exists t1;create table t1(id int,c1 int);alter table t1 drop column c1;alter table t1 add column c1 varchar(20);"
+	sql = "alter table t1 drop column c1;alter table t1 add column c1 varchar(20);"
 	s.testErrorCode(c, sql)
 
-	sql = "drop table if exists t1;create table t1(id int,c1 int);alter table t1 drop column c1,add column c1 varchar(20);"
+	sql = "alter table t1 drop column c1,add column c1 varchar(20);"
 	s.testErrorCode(c, sql)
 
 	// 删除后添加索引
-	sql = "drop table if exists t1;create table t1(id int,c1 int,key ix(c1));alter table t1 drop index ix;alter table t1 add index ix(c1);"
+	sql = "drop table if exists t1;create table t1(id int primary key,c1 int,key ix(c1));"
+	s.mustRunExec(c, sql)
+
+	sql = "alter table t1 drop index ix;alter table t1 add index ix(c1);"
 	s.testErrorCode(c, sql)
 
-	sql = "drop table if exists t1;create table t1(id int,c1 int,key ix(c1));alter table t1 drop index ix,add index ix(c1);"
+	sql = "alter table t1 drop index ix,add index ix(c1);"
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column c2 varchar(20) comment '!@#$%^&*()_+[]{}\\|;:\",.<>/?';"
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column c3 varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";"
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column `c4` varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";"
+	s.testErrorCode(c, sql)
+
+}
+
+func (s *testSessionIncExecSuite) TestAlterTablePtOSC(c *C) {
+	saved := config.GetGlobalConfig().Inc
+	savedOsc := config.GetGlobalConfig().Osc
+	defer func() {
+		config.GetGlobalConfig().Inc = saved
+		config.GetGlobalConfig().Osc = savedOsc
+	}()
+
+	config.GetGlobalConfig().Inc.CheckColumnComment = false
+	config.GetGlobalConfig().Inc.CheckTableComment = false
+	config.GetGlobalConfig().Inc.EnableDropTable = true
+	config.GetGlobalConfig().Osc.OscOn = true
+	config.GetGlobalConfig().Ghost.GhostOn = false
+	config.GetGlobalConfig().Osc.OscMinTableSize = 0
+
+	sql := "drop table if exists t1;create table t1(id int auto_increment primary key,c1 int);"
+	s.mustRunExec(c, sql)
+
+	// 删除后添加列
+	sql = `# 这是一条注释
+		alter table t1 drop column c1;alter table t1 add column c1 varchar(20);`
+	s.testErrorCode(c, sql)
+
+	sql = `/* 这是一条注释 */
+		alter table t1 drop column c1,add column c1 varchar(20);`
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 drop column c1,add column c1 varchar(20) comment '123';"
+	s.testErrorCode(c, sql)
+
+	sql = `-- 这是一条注释
+	alter table t1 add column c2 varchar(20) comment '!@#$%^&*()_+[]{}\\|;:",.<>/?';`
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column c3 varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";"
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column `c4` varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";"
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column `c5` varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";  -- 测试注释"
+	s.testErrorCode(c, sql)
+}
+
+func (s *testSessionIncExecSuite) TestAlterTableGhost(c *C) {
+	saved := config.GetGlobalConfig().Inc
+	savedOsc := config.GetGlobalConfig().Osc
+	defer func() {
+		config.GetGlobalConfig().Inc = saved
+		config.GetGlobalConfig().Osc = savedOsc
+	}()
+
+	config.GetGlobalConfig().Inc.CheckColumnComment = false
+	config.GetGlobalConfig().Inc.CheckTableComment = false
+	config.GetGlobalConfig().Inc.EnableDropTable = true
+	config.GetGlobalConfig().Osc.OscOn = false
+	config.GetGlobalConfig().Ghost.GhostOn = true
+	config.GetGlobalConfig().Osc.OscMinTableSize = 0
+
+	sql := "drop table if exists t1;create table t1(id int auto_increment primary key,c1 int);"
+	s.mustRunExec(c, sql)
+
+	// 删除后添加列
+	sql = `# 这是一条注释
+	alter table t1 drop column c1;alter table t1 add column c1 varchar(20);`
+	s.testErrorCode(c, sql)
+
+	sql = `/* 这是一条注释 */
+	alter table t1 drop column c1,add column c1 varchar(20);`
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 drop column c1,add column c1 varchar(20) comment '123';"
+	s.testErrorCode(c, sql)
+
+	sql = `-- 这是一条注释
+	alter table t1 add column c2 varchar(20) comment '!@#$%^&*()_+[]{}\\|;:",.<>/?';`
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column c3 varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";"
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column `c4` varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";"
+	s.testErrorCode(c, sql)
+
+	sql = "alter table t1 add column `c5` varchar(20) comment \"!@#$%^&*()_+[]{}\\|;:',.<>/?\";  -- 测试注释"
+	s.testErrorCode(c, sql)
+}
+
+// TestDisplayWidth 测试列指定长度参数
+func (s *testSessionIncExecSuite) TestDisplayWidth(c *C) {
+	sql := ""
+	config.GetGlobalConfig().Inc.CheckColumnComment = false
+	config.GetGlobalConfig().Inc.CheckTableComment = false
+	config.GetGlobalConfig().Inc.EnableEnumSetBit = true
+
+	s.mustRunExec(c, "drop table if exists t1;")
+	// 数据类型 警告
+	sql = `create table t1(c1 bit(64),
+	c2 tinyint(255),
+	c3 smallint(255),
+	c4 mediumint(255),
+	c5 int(255),
+	c6 bigint(255) );`
+	s.testErrorCode(c, sql)
+
+	// 数据类型 警告
+	sql = `alter table t1 add column c11 tinyint(255);`
 	s.testErrorCode(c, sql)
 
 }

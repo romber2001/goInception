@@ -21,6 +21,13 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/hanchuanchuan/goInception/ast"
 	"github.com/hanchuanchuan/goInception/config"
 	"github.com/hanchuanchuan/goInception/domain"
@@ -54,12 +61,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/zap"
 	"golang.org/x/net/context"
-	"net"
-	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/jinzhu/gorm"
 )
@@ -98,6 +99,9 @@ type Session interface {
 	// HaveBegin() bool
 	// HaveCommit() bool
 	// RecordSets() *MyRecordSets
+
+	// 用以测试
+	GetAlterTablePostPart(sql string, isPtOSC bool) string
 }
 
 var (
@@ -239,6 +243,8 @@ type session struct {
 	innodbLargePrefix bool
 	// 目标数据库的lower-case-table-names设置, 默认值为1,即不区分大小写
 	LowerCaseTableNames int
+	// PXC集群节点
+	IsClusterNode bool
 }
 
 // DDLOwnerChecker returns s.ddlOwnerChecker.
@@ -312,6 +318,10 @@ func (s *session) SetCollation(coID int) error {
 	}
 	terror.Log(errors.Trace(s.sessionVars.SetSystemVar(variable.CollationConnection, co)))
 	return nil
+}
+
+func (s *session) GetAlterTablePostPart(sql string, isPtOSC bool) string {
+	return s.getAlterTablePostPart(sql, isPtOSC)
 }
 
 func (s *session) PreparedPlanCache() *kvcache.SimpleLRUCache {

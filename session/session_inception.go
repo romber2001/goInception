@@ -40,6 +40,7 @@ import (
 	"github.com/hanchuanchuan/goInception/config"
 	"github.com/hanchuanchuan/goInception/executor"
 	"github.com/hanchuanchuan/goInception/expression"
+	"github.com/hanchuanchuan/goInception/format"
 	"github.com/hanchuanchuan/goInception/model"
 	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/parser/opcode"
@@ -50,16 +51,13 @@ import (
 	"github.com/hanchuanchuan/goInception/util/charset"
 	"github.com/hanchuanchuan/goInception/util/sqlexec"
 	"github.com/hanchuanchuan/goInception/util/stringutil"
-	// "vitess.io/vitess/go/vt/sqlparser"
-	// "github.com/hanchuanchuan/parser/ast"
 	"github.com/jinzhu/gorm"
 	"github.com/percona/go-mysql/query"
 	"github.com/pingcap/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"golang.org/x/net/context"
-	// "os"
-	// "runtime/pprof"
+	// "vitess.io/vitess/go/vt/sqlparser"
 )
 
 // MasterStatus 主库状态信息,包括当前日志文件,位置等
@@ -140,7 +138,11 @@ type sourceOptions struct {
 	sslCert string // 客户端公共密钥证书
 	sslKey  string // 客户端私钥文件
 
+	// 事务支持,一次执行多少条
 	tranBatch int
+
+	// // 扩展参数,支持一次性会话设置
+	// extendParams string
 }
 
 // ExplainInfo 执行计划信息
@@ -325,6 +327,7 @@ func (s *session) ExecuteInc(ctx context.Context, sql string) (recordSets []sqle
 	s.haveBegin = false
 	s.haveCommit = false
 	s.threadID = 0
+	s.IsClusterNode = false
 
 	s.tableCacheList = make(map[string]*TableInfo)
 	s.dbCacheList = make(map[string]*DBInfo)
@@ -438,6 +441,17 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []sqle
 
 			stmtNodes, err := s.ParseSQL(ctx, s1, charsetInfo, collation)
 
+			if err == nil && len(stmtNodes) == 0 {
+				tmpSQL := strings.TrimSpace(s1)
+				// 未成功解析时，添加异常判断
+				if tmpSQL != "" &&
+					!strings.HasPrefix(tmpSQL, "#") &&
+					!strings.HasPrefix(tmpSQL, "--") &&
+					!strings.HasPrefix(tmpSQL, "/*") {
+					err = errors.New("解析失败! 可能是解析器bug,请联系作者.")
+				}
+			}
+
 			if err != nil {
 				log.Errorf("con:%d 解析失败! %s", connID, err)
 				log.Error(s1)
@@ -465,8 +479,8 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []sqle
 			}
 
 			for i, stmtNode := range stmtNodes {
-
-				currentSql := strings.Trim(stmtNode.Text(), " ;\t\r\n")
+				//  是ASCII码160的特殊空格
+				currentSql := strings.Trim(stmtNode.Text(), " ;\t\n\v\f\r ")
 
 				s.myRecord = &Record{
 					Sql:   currentSql,
@@ -486,10 +500,10 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []sqle
 						s.myRecord.Sql = currentSql
 
 						if s.opt != nil && s.opt.Print {
-							s.printSets.Append(2, currentSql, "", GetErrorMessage(ER_HAVE_BEGIN))
+							s.printSets.Append(2, currentSql, "", s.getErrorMessage(ER_HAVE_BEGIN))
 						} else if s.opt != nil && s.opt.split {
 							s.addNewSplitNode()
-							s.splitSets.Append(currentSql, GetErrorMessage(ER_HAVE_BEGIN))
+							s.splitSets.Append(currentSql, s.getErrorMessage(ER_HAVE_BEGIN))
 						} else {
 							s.recordSets.Append(s.myRecord)
 						}
@@ -609,7 +623,7 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []sqle
 					s.SetMyProcessInfo(currentSql, time.Now(), float64(i)/float64(lineCount+1))
 
 					// 交互式命令行
-					if !need {
+					if _, ok := stmtNode.(*ast.InceptionSetStmt); !need && !ok {
 						if s.opt != nil {
 							return nil, errors.New("无效操作!不支持本地操作和远程操作混用!")
 						}
@@ -671,7 +685,12 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []sqle
 				if s.opt != nil && s.opt.Print {
 					// s.printSets.Append(2, "", "", strings.TrimSpace(s.myRecord.Buf.String()))
 				} else {
-					s.recordSets.Append(s.myRecord)
+					// 远程操作时隐藏本地的set命令
+					if _, ok := stmtNode.(*ast.InceptionSetStmt); ok && s.myRecord.ErrLevel == 0 {
+						log.Info(currentSql)
+					} else {
+						s.recordSets.Append(s.myRecord)
+					}
 				}
 			}
 
@@ -683,7 +702,7 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []sqle
 		}
 	}
 
-	if !s.haveCommit {
+	if s.haveBegin && !s.haveCommit {
 		if s.opt != nil && s.opt.Print {
 			s.printSets.Append(2, "", "", "Must end with commit.")
 		} else if s.opt != nil && s.opt.split {
@@ -815,7 +834,7 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 				}
 			}
 		}
-		s.checkSelectItem(node)
+		s.checkSelectItem(node, false)
 		if s.opt.execute {
 			s.AppendErrorNo(ER_NOT_SUPPORTED_YET)
 		}
@@ -828,7 +847,7 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 				}
 			}
 		}
-		s.checkSelectItem(node)
+		s.checkSelectItem(node, false)
 		if s.opt.execute {
 			s.AppendErrorNo(ER_NOT_SUPPORTED_YET)
 		}
@@ -880,7 +899,14 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 		}
 
 	case *ast.InceptionSetStmt:
-		return s.executeInceptionSet(node, currentSql)
+		if s.haveBegin {
+			_, err := s.executeInceptionSet(node, currentSql)
+			if err != nil {
+				s.AppendErrorMessage(err.Error())
+			}
+		} else {
+			return s.executeInceptionSet(node, currentSql)
+		}
 
 	case *ast.ExplainStmt:
 		s.executeInceptionShow(currentSql)
@@ -1104,7 +1130,7 @@ func (s *session) executeCommit(ctx context.Context) {
 		// 如果连接已断开
 		if err := s.backupdb.DB().Ping(); err != nil {
 			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
-			addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql?charset=%s&parseTime=True&loc=Local",
+			addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=%s&parseTime=True&loc=Local&autocommit=1",
 				s.Inc.BackupUser, s.Inc.BackupPassword, s.Inc.BackupHost, s.Inc.BackupPort,
 				s.Inc.DefaultCharset)
 			db, err := gorm.Open("mysql", addr)
@@ -1198,7 +1224,7 @@ func (s *session) mysqlExecuteBackupSqlForDDL(record *Record) {
 	sql := buf.String()
 
 	if err := s.backupdb.Exec(sql).Error; err != nil {
-		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
+		log.Errorf("con:%d %v sql:%s", s.sessionVars.ConnectionID, err, sql)
 		if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
 			s.AppendErrorMessage(myErr.Message)
 		} else {
@@ -2393,7 +2419,8 @@ func (s *session) mysqlServerVersion() {
 
 	var name, value string
 	// sql := "select @@version;"
-	sql := `show variables where Variable_name in ('innodb_large_prefix','version','sql_mode','lower_case_table_names');`
+	sql := `show variables where Variable_name in
+	('innodb_large_prefix','version','sql_mode','lower_case_table_names','wsrep_on');`
 
 	rows, err := s.Raw(sql)
 	if rows != nil {
@@ -2435,7 +2462,7 @@ func (s *session) mysqlServerVersion() {
 				log.Debug("db version: ", s.DBVersion)
 			case "innodb_large_prefix":
 				emptyInnodbLargePrefix = false
-				s.innodbLargePrefix = value == "ON"
+				s.innodbLargePrefix = (value == "ON" || value == "1")
 			case "sql_mode":
 				if err := s.sessionVars.SetSystemVar(variable.SQLModeVar, value); err != nil {
 					log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
@@ -2453,6 +2480,8 @@ func (s *session) mysqlServerVersion() {
 				} else {
 					s.LowerCaseTableNames = v
 				}
+			case "wsrep_on":
+				s.IsClusterNode = (value == "ON" || value == "1")
 			}
 		}
 
@@ -2725,7 +2754,7 @@ func (s *session) checkIsReadOnly() bool {
 		}
 	}
 
-	return value == "ON"
+	return value == "ON" || value == "1"
 }
 
 func (s *session) parseOptions(sql string) {
@@ -2733,7 +2762,7 @@ func (s *session) parseOptions(sql string) {
 	firsts := regParseOption.FindStringSubmatch(sql)
 	if len(firsts) < 2 {
 		log.Warning(sql)
-		s.AppendErrorNo(ER_SQL_INVALID_SOURCE)
+		s.AppendErrorNo(ER_SQL_INVALID_SOURCE, "inception语法格式错误")
 		return
 	}
 
@@ -2775,7 +2804,7 @@ func (s *session) parseOptions(sql string) {
 	viper.ReadConfig(bytes.NewBuffer([]byte(opt)))
 
 	// 设置默认值
-	viper.SetDefault("db", "mysql")
+	// viper.SetDefault("db", "mysql")
 
 	s.opt = &sourceOptions{
 		host:           viper.GetString("host"),
@@ -2834,7 +2863,17 @@ func (s *session) parseOptions(sql string) {
 	// 不再检查密码是否为空
 	if s.opt.host == "" || s.opt.port == 0 || s.opt.user == "" {
 		log.Warningf("%#v", s.opt)
-		s.AppendErrorNo(ER_SQL_INVALID_SOURCE)
+		msg := ""
+		if s.opt.host == "" {
+			msg += "主机名为空,"
+		}
+		if s.opt.port == 0 {
+			msg += "端口为0,"
+		}
+		if s.opt.user == "" {
+			msg += "用户名为空,"
+		}
+		s.AppendErrorNo(ER_SQL_INVALID_SOURCE, strings.TrimRight(msg, ","))
 		return
 	}
 
@@ -2856,7 +2895,7 @@ func (s *session) parseOptions(sql string) {
 			s.opt.middlewareDB, s.Inc.DefaultCharset, s.Inc.MaxAllowedPacket)
 	}
 
-	db, err := gorm.Open("mysql", addr)
+	db, err := gorm.Open("mysql", fmt.Sprintf("%s&autocommit=1", addr))
 
 	if err != nil {
 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
@@ -2880,7 +2919,7 @@ func (s *session) parseOptions(sql string) {
 		if s.Inc.BackupHost == "" || s.Inc.BackupPort == 0 || s.Inc.BackupUser == "" {
 			s.AppendErrorNo(ER_INVALID_BACKUP_HOST_INFO)
 		} else {
-			addr = fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql?charset=%s&parseTime=True&loc=Local",
+			addr = fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=%s&parseTime=True&loc=Local&autocommit=1",
 				s.Inc.BackupUser, s.Inc.BackupPassword, s.Inc.BackupHost, s.Inc.BackupPort,
 				s.Inc.DefaultCharset)
 			backupdb, err := gorm.Open("mysql", addr)
@@ -3356,6 +3395,10 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 			}
 		} else {
 
+			if !strings.HasPrefix(node.Table.Name.L, s.Inc.TablePrefix) {
+				s.AppendErrorNo(ER_TABLE_PREFIX, s.Inc.TablePrefix)
+			}
+
 			// 校验列是否重复指定
 			checkDup := map[string]bool{}
 			for _, c := range node.Cols {
@@ -3406,17 +3449,25 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 				switch ct.Tp {
 				case ast.ConstraintPrimaryKey:
 					hasPrimary = len(ct.Keys) > 0
-
 					for _, col := range ct.Keys {
 						for _, field := range node.Cols {
 							if field.Name.Name.L == col.Column.Name.L {
-								// 设置主键标志
+								// 设置主键标志位
 								field.Tp.Flag |= mysql.PriKeyFlag
 								break
 							}
 						}
 					}
-					break
+				case ast.ConstraintUniq, ast.ConstraintUniqIndex, ast.ConstraintUniqKey:
+					for _, col := range ct.Keys {
+						for _, field := range node.Cols {
+							if field.Name.Name.L == col.Column.Name.L {
+								// 设置唯一键标志位
+								field.Tp.Flag |= mysql.UniqueKeyFlag
+								break
+							}
+						}
+					}
 				}
 			}
 
@@ -3483,7 +3534,7 @@ func (s *session) checkCreateTable(node *ast.CreateTableStmt, sql string) {
 								}
 								// NOT NULL 并且 没有默认值时,自动设置DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 								if hasNotNullFlag && !hasDefault {
-									nowFunc := &ast.FuncCallExpr{FnName: model.NewCIStr("CURRENT_TIMESTAMP")}
+									nowFunc := &ast.FuncCallExpr{FnName: model.NewCIStr(ast.CurrentTimestamp)}
 									field.Options = append(field.Options,
 										&ast.ColumnOption{Tp: ast.ColumnOptionDefaultValue, Expr: nowFunc})
 									field.Options = append(field.Options,
@@ -3844,6 +3895,7 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
 	}
 
 	for i, alter := range node.Specs {
+
 		switch alter.Tp {
 		case ast.AlterTableOption:
 			if len(alter.Options) == 0 {
@@ -3956,11 +4008,11 @@ func (s *session) checkAlterTableAlterColumn(t *TableInfo, c *ast.AlterTableSpec
 
 	for _, nc := range c.NewColumns {
 		found := false
-		var foundField FieldInfo
-		for _, field := range t.Fields {
+		var foundField *FieldInfo
+		for i, field := range t.Fields {
 			if strings.EqualFold(field.Field, nc.Name.Name.O) {
 				found = true
-				foundField = field
+				foundField = &t.Fields[i]
 				break
 			}
 		}
@@ -3986,7 +4038,6 @@ func (s *session) checkAlterTableAlterColumn(t *TableInfo, c *ast.AlterTableSpec
 				// "SET" "DEFAULT" SignedLiteral
 				for _, op := range nc.Options {
 					defaultValue := fmt.Sprint(op.Expr.GetValue())
-
 					if len(defaultValue) == 0 {
 						switch strings.Split(foundField.Type, "(")[0] {
 						case "bit", "smallint", "mediumint", "int",
@@ -4141,10 +4192,11 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 					t := s.cacheTableSnapshot(t)
 
 					t.Fields[foundIndexOld] = *(s.buildNewColumnToCache(t, nc))
+					newField := t.Fields[foundIndexOld]
 
 					if c.Position.Tp == ast.ColumnPositionFirst {
 						tmp := make([]FieldInfo, 0, len(t.Fields))
-						tmp = append(tmp, foundField)
+						tmp = append(tmp, newField)
 						if foundIndexOld > 0 {
 							tmp = append(tmp, t.Fields[:foundIndexOld]...)
 						}
@@ -4173,11 +4225,11 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 							if foundIndex > foundIndexOld {
 								tmp = append(tmp, t.Fields[:foundIndexOld]...)
 								tmp = append(tmp, t.Fields[foundIndexOld+1:foundIndex+1]...)
-								tmp = append(tmp, foundField)
+								tmp = append(tmp, newField)
 								tmp = append(tmp, t.Fields[foundIndex+1:]...)
 							} else {
 								tmp = append(tmp, t.Fields[:foundIndex+1]...)
-								tmp = append(tmp, foundField)
+								tmp = append(tmp, newField)
 								tmp = append(tmp, t.Fields[foundIndex+1:foundIndexOld]...)
 								tmp = append(tmp, t.Fields[foundIndexOld+1:]...)
 							}
@@ -4201,8 +4253,9 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 					// 	buf.WriteString(" AUTO_INCREMENT")
 					// }
 					if foundField.Default != nil {
-						if *foundField.Default == "CURRENT_TIMESTAMP" {
-							buf.WriteString(" DEFAULT CURRENT_TIMESTAMP")
+						if strings.EqualFold(*foundField.Default, ast.CurrentTimestamp) {
+							buf.WriteString(" DEFAULT ")
+							buf.WriteString(strings.ToUpper(ast.CurrentTimestamp))
 						} else {
 							buf.WriteString(" DEFAULT '")
 							buf.WriteString(*foundField.Default)
@@ -4230,12 +4283,12 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 			newFound := false
 			foundIndexOld := -1
 			for i, field := range t.Fields {
-				if strings.EqualFold(field.Field, c.OldColumnName.Name.L) {
+				if strings.EqualFold(field.Field, c.OldColumnName.Name.L) && !field.IsDeleted {
 					oldFound = true
 					foundIndexOld = i
 					foundField = field
 				}
-				if strings.EqualFold(field.Field, nc.Name.Name.L) {
+				if strings.EqualFold(field.Field, nc.Name.Name.L) && !field.IsDeleted {
 					newFound = true
 				}
 			}
@@ -4258,6 +4311,8 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 
 				// t.Fields[foundIndexOld].Field = nc.Name.Name.O
 				t.Fields[foundIndexOld] = *(s.buildNewColumnToCache(t, nc))
+				newField := t.Fields[foundIndexOld]
+
 				// 修改列名后标记有新列
 				t.IsNewColumns = true
 
@@ -4268,7 +4323,7 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 
 					if c.Position.Tp == ast.ColumnPositionFirst {
 						tmp := make([]FieldInfo, 0, len(t.Fields))
-						tmp = append(tmp, foundField)
+						tmp = append(tmp, newField)
 						if foundIndexOld > 0 {
 							tmp = append(tmp, t.Fields[:foundIndexOld]...)
 						}
@@ -4283,6 +4338,7 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 								break
 							}
 						}
+
 						if foundIndex == -1 {
 							s.AppendErrorNo(ER_COLUMN_NOT_EXISTED,
 								fmt.Sprintf("%s.%s", t.Name, c.Position.RelativeColumn.Name))
@@ -4297,11 +4353,11 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 							if foundIndex > foundIndexOld {
 								tmp = append(tmp, t.Fields[:foundIndexOld]...)
 								tmp = append(tmp, t.Fields[foundIndexOld+1:foundIndex+1]...)
-								tmp = append(tmp, foundField)
+								tmp = append(tmp, newField)
 								tmp = append(tmp, t.Fields[foundIndex+1:]...)
 							} else {
 								tmp = append(tmp, t.Fields[:foundIndex+1]...)
-								tmp = append(tmp, foundField)
+								tmp = append(tmp, newField)
 								tmp = append(tmp, t.Fields[foundIndex+1:foundIndexOld]...)
 								tmp = append(tmp, t.Fields[foundIndexOld+1:]...)
 							}
@@ -4325,8 +4381,9 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 					// 	buf.WriteString(" AUTO_INCREMENT")
 					// }
 					if foundField.Default != nil {
-						if *foundField.Default == "CURRENT_TIMESTAMP" {
-							buf.WriteString(" DEFAULT CURRENT_TIMESTAMP")
+						if *foundField.Default == ast.CurrentTimestamp {
+							buf.WriteString(" DEFAULT ")
+							buf.WriteString(strings.ToUpper(ast.CurrentTimestamp))
 						} else {
 							buf.WriteString(" DEFAULT '")
 							buf.WriteString(*foundField.Default)
@@ -4476,7 +4533,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef) {
 		s.AppendErrorNo(ER_INVALID_DATA_TYPE, field.Name.Name)
 	}
 
-	if field.Tp.Tp == mysql.TypeString && field.Tp.Flen > int(s.Inc.MaxCharLength) {
+	if field.Tp.Tp == mysql.TypeString && (s.Inc.MaxCharLength > 0 && field.Tp.Flen > int(s.Inc.MaxCharLength)) {
 		s.AppendErrorNo(ER_CHAR_TO_VARCHAR_LEN, field.Name.Name)
 	}
 
@@ -4522,7 +4579,11 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef) {
 			case ast.ColumnOptionGenerated:
 				hasGenerated = true
 			case ast.ColumnOptionCollate:
-				s.AppendErrorNo(ER_CHARSET_ON_COLUMN, tableName, field.Name.Name)
+				if s.Inc.EnableColumnCharset {
+					s.checkCollation(op.StrValue)
+				} else {
+					s.AppendErrorNo(ER_CHARSET_ON_COLUMN, tableName, field.Name.Name)
+				}
 			}
 		}
 	}
@@ -4552,7 +4613,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef) {
 		switch field.Tp.Tp {
 		case mysql.TypeTiny, mysql.TypeShort, mysql.TypeInt24,
 			mysql.TypeLong, mysql.TypeLonglong,
-			mysql.TypeBit, mysql.TypeYear,
+			mysql.TypeYear,
 			mysql.TypeFloat, mysql.TypeDouble, mysql.TypeNewDecimal:
 			//验证string型默认值的合法性
 			if v, ok := defaultValue.GetValue().(string); ok {
@@ -4585,17 +4646,55 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef) {
 		if !notNullFlag && !hasGenerated {
 			s.AppendErrorNo(ER_NOT_ALLOWED_NULLABLE, field.Name.Name, tableName)
 		}
+	}
 
-		if field.Tp.Charset != "" || field.Tp.Collate != "" {
-			if field.Tp.Charset != "binary" {
+	// 审核所有指定了charset或collate的字段
+	if field.Tp.Charset != "" || field.Tp.Collate != "" {
+		if field.Tp.Charset != "" && field.Tp.Charset != "binary" {
+			if s.Inc.EnableColumnCharset {
+				s.checkCharset(field.Tp.Charset)
+			} else {
+				s.AppendErrorNo(ER_CHARSET_ON_COLUMN, tableName, field.Name.Name)
+			}
+		} else if field.Tp.Collate != "" && field.Tp.Collate != "binary" {
+			if s.Inc.EnableColumnCharset {
+				s.checkCollation(field.Tp.Collate)
+			} else {
 				s.AppendErrorNo(ER_CHARSET_ON_COLUMN, tableName, field.Name.Name)
 			}
 		}
 	}
 
-	if isIncorrectName(field.Name.Name.O) {
-		s.AppendErrorNo(ER_WRONG_COLUMN_NAME, field.Name.Name)
+	// 检查bit类型的默认值
+	// 只允许数字0和1,以及二进制写法如 b'1'
+	if hasDefaultValue && field.Tp.Tp == mysql.TypeBit {
+		switch defaultValue.Kind() {
+		case types.KindInt64:
+			if defaultValue.GetInt64() != 0 && defaultValue.GetInt64() != 1 {
+				s.AppendErrorNo(ER_INVALID_DEFAULT, field.Name.Name.O)
+			}
+		case types.KindUint64:
+			if defaultValue.GetUint64() != 0 && defaultValue.GetUint64() != 1 {
+				s.AppendErrorNo(ER_INVALID_DEFAULT, field.Name.Name.O)
+			}
+		case types.KindMysqlBit, types.KindBinaryLiteral:
+			v := defaultValue.GetBinaryLiteral()
+			if len(v) == 0 {
+				s.AppendErrorNo(ER_INVALID_DEFAULT, field.Name.Name.O)
+			}
+		case types.KindString:
+			if defaultValue.GetString() != "" {
+				s.AppendErrorNo(ER_INVALID_DEFAULT, field.Name.Name.O)
+			}
+		default:
+			s.AppendErrorNo(ER_INVALID_DEFAULT, field.Name.Name.O)
+		}
 	}
+
+	// if isIncorrectName(field.Name.Name.O) {
+	// 	s.AppendErrorNo(ER_WRONG_COLUMN_NAME, field.Name.Name)
+	// }
+
 	//text/blob/json 字段禁止设置NOT NULL
 	if (types.IsTypeBlob(field.Tp.Tp) || field.Tp.Tp == mysql.TypeJSON) && notNullFlag {
 		s.AppendErrorNo(ER_TEXT_NOT_NULLABLE_ERROR, field.Name.Name, tableName)
@@ -4625,6 +4724,7 @@ func (s *session) mysqlCheckField(t *TableInfo, field *ast.ColumnDef) {
 		s.AppendErrorNo(ER_WITH_DEFAULT_ADD_COLUMN, field.Name.Name.O, tableName)
 	}
 
+	s.checkColumn(field)
 	// if (thd->variables.sql_mode & MODE_NO_ZERO_DATE &&
 	//        is_timestamp_type(field->sql_type) && !field->def &&
 	//        (field->flags & NOT_NULL_FLAG) &&
@@ -4689,8 +4789,8 @@ func (s *session) checkIndexAttr(tp ast.ConstraintType, name string,
 		s.AppendErrorNo(ER_FOREIGN_KEY, table.Name)
 
 	case ast.ConstraintUniq:
-		if !strings.HasPrefix(strings.ToLower(name), "uniq_") {
-			s.AppendErrorNo(ER_INDEX_NAME_UNIQ_PREFIX, name, table.Name)
+		if !strings.HasPrefix(strings.ToLower(name), s.Inc.UniqIndexPrefix) {
+			s.AppendErrorNo(ER_INDEX_NAME_UNIQ_PREFIX, name, s.Inc.UniqIndexPrefix, table.Name)
 		}
 
 	case ast.ConstraintSpatial:
@@ -4699,8 +4799,8 @@ func (s *session) checkIndexAttr(tp ast.ConstraintType, name string,
 		}
 
 	default:
-		if !strings.HasPrefix(strings.ToLower(name), "idx_") {
-			s.AppendErrorNo(ER_INDEX_NAME_IDX_PREFIX, name, table.Name)
+		if !strings.HasPrefix(strings.ToLower(name), s.Inc.IndexPrefix) {
+			s.AppendErrorNo(ER_INDEX_NAME_IDX_PREFIX, name, s.Inc.IndexPrefix, table.Name)
 		}
 	}
 
@@ -5563,7 +5663,7 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 			if !s.hasError() {
 				// 如果不是新建表时,则直接explain
 				if haveNewTable {
-					s.checkSelectItem(x.Select)
+					s.checkSelectItem(x.Select, sel.Where != nil)
 				} else {
 					var selectSql string
 					if table.IsNew || table.IsNewColumns || s.DBVersion < 50600 {
@@ -5592,7 +5692,7 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 			if sel.OrderBy != nil {
 				for _, item := range sel.OrderBy.Items {
 					if f, ok := item.Expr.(*ast.FuncCallExpr); ok {
-						if f.FnName.L == "rand" {
+						if f.FnName.L == ast.Rand {
 							s.AppendErrorNo(ER_ORDERY_BY_RAND)
 						}
 					}
@@ -5930,6 +6030,15 @@ func (s *session) executeInceptionSet(node *ast.InceptionSetStmt, sql string) ([
 			return nil, errors.New("无效参数")
 		}
 
+		if v.IsGlobal && s.haveBegin {
+			return nil, errors.New("全局变量仅支持单独设置")
+		}
+
+		// 非本地模式时,只使用全局设置
+		if !s.haveBegin {
+			v.IsGlobal = true
+		}
+
 		var value *ast.ValueExpr
 
 		switch expr := v.Value.(type) {
@@ -5947,7 +6056,10 @@ func (s *session) executeInceptionSet(node *ast.InceptionSetStmt, sql string) ([
 		cnf := config.GetGlobalConfig()
 
 		if v.IsLevel {
-			err := s.setLevelValue(reflect.TypeOf(cnf.IncLevel), reflect.ValueOf(&cnf.IncLevel).Elem(), v.Name, value)
+			if s.haveBegin {
+				return nil, errors.New("暂不支持会话级的自定义审核级别")
+			}
+			err := s.setVariableValue(reflect.TypeOf(cnf.IncLevel), reflect.ValueOf(&cnf.IncLevel).Elem(), v.Name, value)
 			if err != nil {
 				return nil, err
 			}
@@ -5964,24 +6076,42 @@ func (s *session) executeInceptionSet(node *ast.InceptionSetStmt, sql string) ([
 		var err error
 		switch prefix {
 		case "osc":
-			err = s.setVariableValue(reflect.TypeOf(cnf.Osc), reflect.ValueOf(&cnf.Osc).Elem(), v.Name, value)
-			if err != nil {
-				return nil, err
+			var object *config.Osc
+			if v.IsGlobal {
+				object = &cnf.Osc
+			} else {
+				object = &s.Osc
 			}
-		case "ghost":
-			err = s.setVariableValue(reflect.TypeOf(cnf.Ghost), reflect.ValueOf(&cnf.Ghost).Elem(), v.Name, value)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			err = s.setVariableValue(reflect.TypeOf(cnf.Inc), reflect.ValueOf(&cnf.Inc).Elem(), v.Name, value)
+			err = s.setVariableValue(reflect.TypeOf(*object), reflect.ValueOf(object).Elem(), v.Name, value)
 			if err != nil {
 				return nil, err
 			}
 
-			// 错误信息语言设置
-			if prefix == "lang" {
-				SetLanguage(value.GetString())
+		case "ghost":
+			var object *config.Ghost
+			if v.IsGlobal {
+				object = &cnf.Ghost
+			} else {
+				object = &s.Ghost
+			}
+			err = s.setVariableValue(reflect.TypeOf(*object), reflect.ValueOf(object).Elem(), v.Name, value)
+			if err != nil {
+				return nil, err
+			}
+
+		default:
+			if prefix == "version" {
+				return nil, errors.New("只读变量")
+			}
+			var object *config.Inc
+			if v.IsGlobal {
+				object = &cnf.Inc
+			} else {
+				object = &s.Inc
+			}
+			err = s.setVariableValue(reflect.TypeOf(*object), reflect.ValueOf(object).Elem(), v.Name, value)
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -5991,10 +6121,6 @@ func (s *session) executeInceptionSet(node *ast.InceptionSetStmt, sql string) ([
 
 func (s *session) setVariableValue(t reflect.Type, values reflect.Value,
 	name string, value *ast.ValueExpr) error {
-
-	// t := reflect.TypeOf(*(obj))
-	// // values := reflect.ValueOf(obj).Elem()
-	// values := reflect.ValueOf(obj).Elem()
 
 	found := false
 	for i := 0; i < values.NumField(); i++ {
@@ -6265,7 +6391,7 @@ func splitWhere(where ast.ExprNode) []ast.ExprNode {
 }
 
 // checkColumnName: 检查列是否存在
-func checkColumnName(expr ast.ExprNode, colNames []string) (colIndex int, err error) {
+func (s *session) checkColumnName(expr ast.ExprNode, colNames []string) (colIndex int, err error) {
 	colIndex = -1
 	if e, ok := expr.(*ast.ColumnNameExpr); ok {
 		found := false
@@ -6276,19 +6402,19 @@ func checkColumnName(expr ast.ExprNode, colNames []string) (colIndex int, err er
 			}
 		}
 		if !found {
-			return colIndex, errors.New(fmt.Sprintf(GetErrorMessage(ER_COLUMN_NOT_EXISTED), e.Name.Name.String()))
+			return colIndex, errors.New(fmt.Sprintf(s.getErrorMessage(ER_COLUMN_NOT_EXISTED), e.Name.Name.String()))
 		}
 	}
 	return colIndex, nil
 }
 
 // filterExprNode: 条件筛选
-func filterExprNode(expr ast.ExprNode, colNames []string, values []string) (bool, error) {
+func (s *session) filterExprNode(expr ast.ExprNode, colNames []string, values []string) (bool, error) {
 	switch x := expr.(type) {
 	case *ast.BinaryOperationExpr:
 		switch x.Op {
 		case opcode.EQ:
-			colIndex, err := checkColumnName(x.L, colNames)
+			colIndex, err := s.checkColumnName(x.L, colNames)
 			if err != nil {
 				return false, err
 			}
@@ -6305,7 +6431,7 @@ func filterExprNode(expr ast.ExprNode, colNames []string, values []string) (bool
 			return false, errors.New("不支持的操作")
 		}
 	case *ast.PatternLikeExpr:
-		colIndex, err := checkColumnName(x.Expr, colNames)
+		colIndex, err := s.checkColumnName(x.Expr, colNames)
 		if err != nil {
 			return false, err
 		}
@@ -6330,9 +6456,9 @@ func filterExprNode(expr ast.ExprNode, colNames []string, values []string) (bool
 }
 
 // filter: 条件筛选
-func filter(expr []ast.ExprNode, colNames []string, value []string) (bool, error) {
+func (s *session) filter(expr []ast.ExprNode, colNames []string, value []string) (bool, error) {
 	for _, e := range expr {
-		ok, err := filterExprNode(e, colNames, value)
+		ok, err := s.filterExprNode(e, colNames, value)
 		if err != nil {
 			return false, err
 		}
@@ -6369,8 +6495,8 @@ func (s *session) executeLocalShowLevels(node *ast.ShowStmt) ([]sqlexec.RecordSe
 		name := code.String()
 		if v, ok := s.incLevel[name]; ok {
 			if len(filters) > 0 {
-				ok, err := filter(filters, names, []string{
-					name, strconv.Itoa(int(v)), GetErrorMessage(code),
+				ok, err := s.filter(filters, names, []string{
+					name, strconv.Itoa(int(v)), s.getErrorMessage(code),
 				})
 				if err != nil {
 					return nil, err
@@ -6379,58 +6505,14 @@ func (s *session) executeLocalShowLevels(node *ast.ShowStmt) ([]sqlexec.RecordSe
 					continue
 				}
 			}
-			res.Append(name, int64(v), GetErrorMessage(code))
-
-			// if len(like) == 0 {
-			// 	if len(filters) > 0 {
-			// 		ok, err := filter(filters, names, []string{
-			// 			name, string(v), GetErrorMessage(code),
-			// 		})
-			// 		if err != nil {
-			// 			return nil, err
-			// 		}
-			// 		if !ok {
-			// 			continue
-			// 		}
-			// 	}
-
-			// 	res.Append(name, int64(v), GetErrorMessage(code))
-			// } else {
-			// 	match := stringutil.DoMatch(name, patChars, patTypes)
-			// 	if match && !node.Pattern.Not {
-			// 		if len(filters) > 0 {
-			// 			ok, err := filter(filters, names, []string{
-			// 				name, string(v), GetErrorMessage(code),
-			// 			})
-			// 			if err != nil {
-			// 				return nil, err
-			// 			}
-			// 			if !ok {
-			// 				continue
-			// 			}
-			// 		}
-			// 		res.Append(name, int64(v), GetErrorMessage(code))
-			// 	} else if !match && node.Pattern.Not {
-			// 		if len(filters) > 0 {
-			// 			ok, err := filter(filters, names, []string{
-			// 				name, string(v), GetErrorMessage(code),
-			// 			})
-			// 			if err != nil {
-			// 				return nil, err
-			// 			}
-			// 			if !ok {
-			// 				continue
-			// 			}
-			// 		}
-			// 		res.Append(name, int64(v), GetErrorMessage(code))
-			// 	}
-			// }
+			res.Append(name, int64(v), s.getErrorMessage(code))
 		}
 	}
 
 	s.sessionVars.StmtCtx.AddAffectedRows(uint64(res.rc.count))
 	return res.Rows(), nil
 }
+
 func (s *session) executeLocalShowOscProcesslist(node *ast.ShowOscStmt) ([]sqlexec.RecordSet, error) {
 	pl := s.sessionManager.ShowOscProcessList()
 
@@ -6818,7 +6900,7 @@ func (s *session) getExplainInfo(sql string, sqlId string) {
 			s.AppendErrorNo(ER_UDPATE_TOO_MUCH_ROWS,
 				r.AffectedRows, s.Inc.MaxUpdateRows)
 			if newRecord != nil {
-				newRecord.AppendErrorNo(ER_UDPATE_TOO_MUCH_ROWS,
+				newRecord.AppendErrorNo(s.Inc.Lang, ER_UDPATE_TOO_MUCH_ROWS,
 					r.AffectedRows, s.Inc.MaxUpdateRows)
 			}
 		}
@@ -6836,12 +6918,12 @@ func (s *session) getRealRowCount(sql string, sqlId string) {
 		return
 	}
 
-	var newRecord *Record
-	if s.Inc.EnableFingerprint && sqlId != "" {
-		newRecord = &Record{
-			Buf: new(bytes.Buffer),
-		}
-	}
+	// var newRecord *Record
+	// if s.Inc.EnableFingerprint && sqlId != "" {
+	// 	newRecord = &Record{
+	// 		Buf: new(bytes.Buffer),
+	// 	}
+	// }
 	r := s.myRecord
 
 	var value int
@@ -6854,14 +6936,14 @@ func (s *session) getRealRowCount(sql string, sqlId string) {
 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
 		if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
 			s.AppendErrorMessage(myErr.Message)
-			if newRecord != nil {
-				newRecord.AppendErrorMessage(myErr.Message)
-			}
+			// if newRecord != nil {
+			// 	newRecord.AppendErrorMessage(myErr.Message)
+			// }
 		} else {
 			s.AppendErrorMessage(err.Error())
-			if newRecord != nil {
-				newRecord.AppendErrorMessage(myErr.Message)
-			}
+			// if newRecord != nil {
+			// 	newRecord.AppendErrorMessage(myErr.Message)
+			// }
 		}
 		return
 	} else {
@@ -6870,29 +6952,26 @@ func (s *session) getRealRowCount(sql string, sqlId string) {
 		}
 	}
 
-	// log.Info(sql)
-	// log.Info(value)
-
 	r.AffectedRows = value
-	if newRecord != nil {
-		newRecord.AffectedRows = r.AffectedRows
-	}
+	// if newRecord != nil {
+	// 	newRecord.AffectedRows = r.AffectedRows
+	// }
 
 	if s.Inc.MaxUpdateRows > 0 && r.AffectedRows > int(s.Inc.MaxUpdateRows) {
 		switch r.Type.(type) {
 		case *ast.DeleteStmt, *ast.UpdateStmt:
 			s.AppendErrorNo(ER_UDPATE_TOO_MUCH_ROWS,
 				r.AffectedRows, s.Inc.MaxUpdateRows)
-			if newRecord != nil {
-				newRecord.AppendErrorNo(ER_UDPATE_TOO_MUCH_ROWS,
-					r.AffectedRows, s.Inc.MaxUpdateRows)
-			}
+			// if newRecord != nil {
+			// 	newRecord.AppendErrorNo(ER_UDPATE_TOO_MUCH_ROWS,
+			// 		r.AffectedRows, s.Inc.MaxUpdateRows)
+			// }
 		}
 	}
 
-	if newRecord != nil {
-		s.sqlFingerprint[sqlId] = newRecord
-	}
+	// if newRecord != nil {
+	// 	s.sqlFingerprint[sqlId] = newRecord
+	// }
 }
 
 func (s *session) explainOrAnalyzeSql(sql string) {
@@ -7118,7 +7197,7 @@ func (s *session) checkUpdate(node *ast.UpdateStmt, sql string) {
 				s.checkItem(l.Expr, tableInfoList)
 			}
 
-			s.checkSelectItem(node.TableRefs.TableRefs)
+			s.checkSelectItem(node.TableRefs.TableRefs, node.Where != nil)
 			// if node.TableRefs.TableRefs.On != nil {
 			// 	s.checkItem(node.TableRefs.TableRefs.On.Expr, tableInfoList)
 			// }
@@ -7230,14 +7309,14 @@ func (s *session) checkItem(expr ast.ExprNode, tables []*TableInfo) bool {
 		s.checkItem(e.Expr, tables)
 
 	case *ast.SubqueryExpr:
-		s.checkSelectItem(e.Query)
+		s.checkSelectItem(e.Query, false)
 
 	case *ast.CompareSubqueryExpr:
 		s.checkItem(e.L, tables)
 		s.checkItem(e.R, tables)
 
 	case *ast.ExistsSubqueryExpr:
-		s.checkSelectItem(e.Sel)
+		s.checkSelectItem(e.Sel, false)
 
 	case *ast.IsNullExpr:
 		s.checkItem(e.Expr, tables)
@@ -7589,25 +7668,25 @@ func (r *Record) AppendErrorMessage(msg string) {
 	r.Buf.WriteString("\n")
 }
 
-func (r *Record) AppendErrorNo(number ErrorCode, values ...interface{}) {
+func (r *Record) AppendErrorNo(lang string, number ErrorCode, values ...interface{}) {
 	r.ErrLevel = uint8(Max(int(r.ErrLevel), int(GetErrorLevel(number))))
 
 	if len(values) == 0 {
-		r.Buf.WriteString(GetErrorMessage(number))
+		r.Buf.WriteString(GetErrorMessage(number, lang))
 	} else {
-		r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number), values...))
+		r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number, lang), values...))
 	}
 	r.Buf.WriteString("\n")
 }
 
 // AppendWarning 添加警告. 错误级别指定为警告
-func (r *Record) AppendWarning(number ErrorCode, values ...interface{}) {
+func (r *Record) AppendWarning(lang string, number ErrorCode, values ...interface{}) {
 	r.ErrLevel = uint8(Max(int(r.ErrLevel), 1))
 
 	if len(values) == 0 {
-		r.Buf.WriteString(GetErrorMessage(number))
+		r.Buf.WriteString(GetErrorMessage(number, lang))
 	} else {
-		r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number), values...))
+		r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number, lang), values...))
 	}
 	r.Buf.WriteString("\n")
 }
@@ -7630,7 +7709,7 @@ func (s *session) AppendWarning(number ErrorCode, values ...interface{}) {
 	} else if s.stage == StageExec {
 		s.myRecord.Buf.WriteString("Execute: ")
 	}
-	s.myRecord.AppendWarning(number, values...)
+	s.myRecord.AppendWarning(s.Inc.Lang, number, values...)
 	s.recordSets.MaxLevel = uint8(Max(int(s.recordSets.MaxLevel), int(s.myRecord.ErrLevel)))
 }
 
@@ -7658,9 +7737,9 @@ func (s *session) AppendErrorNo(number ErrorCode, values ...interface{}) {
 			r.Buf.WriteString("Execute: ")
 		}
 		if len(values) == 0 {
-			r.Buf.WriteString(GetErrorMessage(number))
+			r.Buf.WriteString(s.getErrorMessage(number))
 		} else {
-			r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number), values...))
+			r.Buf.WriteString(fmt.Sprintf(s.getErrorMessage(number), values...))
 		}
 		r.Buf.WriteString("\n")
 	}
@@ -7953,27 +8032,25 @@ func (s *session) buildNewColumnToCache(t *TableInfo, field *ast.ColumnDef) *Fie
 			field.Tp.Flag |= mysql.UniqueKeyFlag
 
 		case ast.ColumnOptionDefaultValue:
-			if op.Expr.GetDatum().IsNull() {
-				switch op.Expr.(type) {
-				case *ast.FuncCallExpr:
-					// 如果字段默认值为函数, 则需要进一步判断是否为为current_timestamp()函数
-					if expression.IsCurrentTimestampExpr(op.Expr) {
-						c.Default = new(string)
-						*c.Default = ast.CurrentTimestamp
-					} else {
-						c.Null = "YES"
-						// *c.Default = "NULL"
-						c.Default = nil
-					}
-				default:
-					c.Null = "YES"
-					// *c.Default = "NULL"
-					c.Default = nil
-				}
-			} else {
+			switch v := op.Expr.(type) {
+			case *ast.FuncCallExpr:
 				c.Default = new(string)
-				*c.Default = fmt.Sprint(op.Expr.GetValue())
+				*c.Default = v.FnName.L
+			case *ast.ValueExpr:
+				if v.GetValue() == nil {
+					c.Null = "YES"
+					c.Default = nil
+				} else {
+					c.Default = new(string)
+					*c.Default = v.GetString()
+				}
+			default:
+				c.Default = new(string)
+				var builder strings.Builder
+				op.Expr.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &builder))
+				*c.Default = builder.String()
 			}
+
 		case ast.ColumnOptionAutoIncrement:
 			if strings.ToLower(c.Field) != "id" {
 				s.AppendErrorNo(ER_AUTO_INCR_ID_WARNING, c.Field)
@@ -8084,7 +8161,8 @@ func (s *session) copyTableInfo(t *TableInfo) *TableInfo {
 	return p
 }
 
-func (s *session) checkSelectItem(node ast.ResultSetNode) []*TableInfo {
+// checkSelectItem 子句递归检查
+func (s *session) checkSelectItem(node ast.ResultSetNode, hasWhere bool) []*TableInfo {
 	if node == nil {
 		return nil
 	}
@@ -8109,18 +8187,23 @@ func (s *session) checkSelectItem(node ast.ResultSetNode) []*TableInfo {
 		return s.checkSubSelectItem(x)
 
 	case *ast.Join:
-		tableInfoList := s.checkSelectItem(x.Left)
-		tableInfoList = append(tableInfoList, s.checkSelectItem(x.Right)...)
+		tableInfoList := s.checkSelectItem(x.Left, false)
+		tableInfoList = append(tableInfoList, s.checkSelectItem(x.Right, false)...)
 
 		// b, _ := json.MarshalIndent(x, "", "  ")
 		// log.Info(string(b))
 
 		// log.Infof("%#v", x.Left)
 		// log.Infof("%#v", x.Right)
+		// log.Infof("%#v", x)
+
 		if x.On != nil {
 			s.checkItem(x.On.Expr, tableInfoList)
 		} else if x.Right != nil {
-			s.AppendErrorNo(ErrJoinNoOnCondition)
+			// 没有任何where条件时
+			if !hasWhere && !x.NaturalJoin && !x.StraightJoin && x.Using == nil {
+				s.AppendErrorNo(ErrJoinNoOnCondition)
+			}
 		}
 		return tableInfoList
 	case *ast.TableSource:
@@ -8155,7 +8238,7 @@ func (s *session) checkSelectItem(node ast.ResultSetNode) []*TableInfo {
 			}
 
 		case *ast.UnionStmt:
-			s.checkSelectItem(tblSource)
+			s.checkSelectItem(tblSource, false)
 
 			cols := s.getSubSelectColumns(tblSource)
 			if cols != nil {
@@ -8172,7 +8255,7 @@ func (s *session) checkSelectItem(node ast.ResultSetNode) []*TableInfo {
 			}
 
 		default:
-			return s.checkSelectItem(tblSource)
+			return s.checkSelectItem(tblSource, false)
 			// log.Infof("%T", x)
 			// log.Infof("%#v", x)
 		}
@@ -8238,7 +8321,7 @@ func (s *session) checkSubSelectItem(node *ast.SelectStmt) []*TableInfo {
 			}
 		default:
 			log.Infof("con:%d %T", s.sessionVars.ConnectionID, x)
-			tableInfoList = append(tableInfoList, s.checkSelectItem(tblSource)...)
+			tableInfoList = append(tableInfoList, s.checkSelectItem(tblSource, false)...)
 		}
 	}
 
@@ -8506,4 +8589,9 @@ func (s *session) checkSetStmt(node *ast.SetStmt) {
 // IgnoreCase 判断是否忽略大小写
 func (s *session) IgnoreCase() bool {
 	return s.LowerCaseTableNames > 0
+}
+
+// getErrorMessage 获取审核信息
+func (s *session) getErrorMessage(code ErrorCode) string {
+	return GetErrorMessage(code, s.Inc.Lang)
 }

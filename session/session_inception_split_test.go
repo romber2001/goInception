@@ -16,17 +16,12 @@ package session_test
 import (
 	"fmt"
 	"strconv"
+
 	// "strings"
 	"testing"
 
 	"github.com/hanchuanchuan/goInception/config"
-	"github.com/hanchuanchuan/goInception/domain"
-	"github.com/hanchuanchuan/goInception/kv"
-	"github.com/hanchuanchuan/goInception/session"
-	"github.com/hanchuanchuan/goInception/store/mockstore"
-	"github.com/hanchuanchuan/goInception/store/mockstore/mocktikv"
 	"github.com/hanchuanchuan/goInception/util/testkit"
-	"github.com/hanchuanchuan/goInception/util/testleak"
 	. "github.com/pingcap/check"
 )
 
@@ -37,45 +32,16 @@ func TestSplit(t *testing.T) {
 }
 
 type testSessionSplitSuite struct {
-	cluster   *mocktikv.Cluster
-	mvccStore mocktikv.MVCCStore
-	store     kv.Storage
-	dom       *domain.Domain
-	tk        *testkit.TestKit
-
-	version int
-	sqlMode string
-
-	rows [][]interface{}
+	testCommon
 }
 
 func (s *testSessionSplitSuite) SetUpSuite(c *C) {
 
-	if testing.Short() {
-		c.Skip("skipping test; in TRAVIS mode")
-	}
+	s.initSetUp(c)
 
-	testleak.BeforeTest()
-	s.cluster = mocktikv.NewCluster()
-	mocktikv.BootstrapWithSingleStore(s.cluster)
-	s.mvccStore = mocktikv.MustNewMVCCStore()
-	store, err := mockstore.NewMockTikvStore(
-		mockstore.WithCluster(s.cluster),
-		mockstore.WithMVCCStore(s.mvccStore),
-	)
-	c.Assert(err, IsNil)
-	s.store = store
-	session.SetSchemaLease(0)
-	session.SetStatsLease(0)
-	s.dom, err = session.BootstrapSession(s.store)
-	c.Assert(err, IsNil)
-
-	// config.GetGlobalConfig().Inc.Lang = "zh-CN"
-	// session.SetLanguage("zh-CN")
 	config.GetGlobalConfig().Inc.Lang = "en-US"
 	config.GetGlobalConfig().Inc.EnableFingerprint = true
 	config.GetGlobalConfig().Inc.SqlSafeUpdates = 0
-	session.SetLanguage("en-US")
 
 	if s.tk == nil {
 		s.tk = testkit.NewTestKitWithInit(c, s.store)
@@ -83,13 +49,7 @@ func (s *testSessionSplitSuite) SetUpSuite(c *C) {
 }
 
 func (s *testSessionSplitSuite) TearDownSuite(c *C) {
-	if testing.Short() {
-		c.Skip("skipping test; in TRAVIS mode")
-	} else {
-		s.dom.Close()
-		s.store.Close()
-		testleak.AfterTest(c)()
-	}
+	s.tearDownSuite(c)
 }
 
 func (s *testSessionSplitSuite) makeSQL(sql string) *testkit.Result {
@@ -136,7 +96,7 @@ inception_magic_commit;`
 	c.Assert(int(s.tk.Se.AffectedRows()), Equals, 1)
 	row := res.Rows()[s.tk.Se.AffectedRows()-1]
 	// c.Assert(row[3], Equals, "line 1 column 3 near \"\" (total length 3)")
-	c.Assert(row[3], Equals, "You have an error in your SQL syntax, near '' at line 1")
+	c.Assert(row[3], Equals, "You have an error in your SQL syntax, near '123' at line 1")
 }
 
 func (s *testSessionSplitSuite) TestInsert(c *C) {

@@ -38,14 +38,13 @@ const maxBadConnRetries = 2
 // createNewConnection 用来创建新的连接
 // 注意: 该方法可能导致driver: bad connection异常
 func (s *session) createNewConnection(dbName string) {
-	addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=Local&maxAllowedPacket=%d",
+	addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=Local&autocommit=1&maxAllowedPacket=%d",
 		s.opt.user, s.opt.password, s.opt.host, s.opt.port,
 		dbName, s.Inc.DefaultCharset, s.Inc.MaxAllowedPacket)
 
 	db, err := gorm.Open("mysql", addr)
 
 	if err != nil {
-		// log.Error(err)
 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
 		s.AppendErrorMessage(err.Error())
 		return
@@ -72,7 +71,6 @@ func (s *session) Raw(sqlStr string) (rows *sql.Rows, err error) {
 		if err == nil {
 			return
 		} else {
-			// log.Error(err)
 			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
 			if err == mysqlDriver.ErrInvalidConn {
 				err1 := s.initConnection()
@@ -97,8 +95,7 @@ func (s *session) Exec(sqlStr string, retry bool) (res sql.Result, err error) {
 		if err == nil {
 			return
 		} else {
-			// log.Error(err)
-			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
+			log.Errorf("con:%d %v sql:%s", s.sessionVars.ConnectionID, err, sqlStr)
 			if err == mysqlDriver.ErrInvalidConn {
 				err1 := s.initConnection()
 				if err1 != nil {
@@ -126,7 +123,6 @@ func (s *session) RawScan(sqlStr string, dest interface{}) (err error) {
 			return
 		} else {
 			if err == mysqlDriver.ErrInvalidConn {
-				// log.Error(err)
 				log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
 				err1 := s.initConnection()
 				if err1 != nil {
@@ -146,18 +142,22 @@ func (s *session) RawScan(sqlStr string, dest interface{}) (err error) {
 func (s *session) initConnection() (err error) {
 	name := s.DBName
 	if name == "" {
-		name = "mysql"
+		name = s.opt.db
 	}
 
 	// 连接断开无效时,自动重试
 	for i := 0; i < maxBadConnRetries; i++ {
-		if err = s.db.Exec(fmt.Sprintf("USE `%s`", name)).Error; err == nil {
+		if name == "" {
+			err = s.db.DB().Ping()
+		} else {
+			err = s.db.Exec(fmt.Sprintf("USE `%s`", name)).Error
+		}
+		if err == nil {
 			// 连接重连时,清除线程ID缓存
 			// s.threadID = 0
 			log.Infof("con:%d 数据库断开重连", s.sessionVars.ConnectionID)
 			return
 		} else {
-			// log.Error(err)
 			log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
 			if err != mysqlDriver.ErrInvalidConn {
 				if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
@@ -171,7 +171,6 @@ func (s *session) initConnection() (err error) {
 	}
 
 	if err != nil {
-		// log.Error(err)
 		log.Errorf("con:%d %v", s.sessionVars.ConnectionID, err)
 		if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
 			s.AppendErrorMessage(myErr.Message)

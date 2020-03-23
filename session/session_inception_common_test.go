@@ -23,9 +23,12 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/hanchuanchuan/goInception/ast"
 	"github.com/hanchuanchuan/goInception/config"
 	"github.com/hanchuanchuan/goInception/domain"
 	"github.com/hanchuanchuan/goInception/kv"
+	"github.com/hanchuanchuan/goInception/parser"
+	"github.com/hanchuanchuan/goInception/server"
 	"github.com/hanchuanchuan/goInception/session"
 	"github.com/hanchuanchuan/goInception/store/mockstore"
 	"github.com/hanchuanchuan/goInception/store/mockstore/mocktikv"
@@ -33,10 +36,8 @@ import (
 	"github.com/hanchuanchuan/goInception/util/testleak"
 	"github.com/jinzhu/gorm"
 	. "github.com/pingcap/check"
+	repllog "github.com/siddontang/go-log/log"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/hanchuanchuan/goInception/ast"
-	"github.com/hanchuanchuan/goInception/parser"
 )
 
 var _ = Suite(&testCommon{})
@@ -55,6 +56,10 @@ type testCommon struct {
 	db        *gorm.DB
 	dbAddr    string
 
+	// 执行结果集
+	// res *testkit.Result
+	rows [][]interface{}
+
 	DBVersion         int
 	sqlMode           string
 	innodbLargePrefix bool
@@ -67,6 +72,13 @@ type testCommon struct {
 
 	remoteBackupTable string
 	parser            *parser.Parser
+
+	session session.Session
+
+	defaultInc config.Inc
+
+	// 测试数据库,默认为test_inc,该参数用以测试未指定数据库情况下的审核
+	useDB string
 }
 
 func (s *testCommon) initSetUp(c *C) {
@@ -74,7 +86,13 @@ func (s *testCommon) initSetUp(c *C) {
 	if testing.Short() {
 		c.Skip("skipping test; in TRAVIS mode")
 	}
+
+	log.SetLevel(log.ErrorLevel)
+	repllog.SetLevel(repllog.LevelFatal)
+
 	s.realRowCount = true
+
+	s.useDB = "use test_inc;"
 
 	testleak.BeforeTest()
 	s.cluster = mocktikv.NewCluster()
@@ -88,12 +106,19 @@ func (s *testCommon) initSetUp(c *C) {
 	s.store = store
 	session.SetSchemaLease(0)
 	session.SetStatsLease(0)
+
 	s.dom, err = session.BootstrapSession(s.store)
 	c.Assert(err, IsNil)
 
 	if s.tk == nil {
 		s.tk = testkit.NewTestKitWithInit(c, s.store)
 	}
+
+	server := &server.Server{}
+	server.InitOscProcessList()
+	s.tk.Se.SetSessionManager(server)
+
+	s.session = s.tk.Se
 
 	cfg := config.GetGlobalConfig()
 	_, localFile, _, _ := runtime.Caller(0)
@@ -113,7 +138,7 @@ func (s *testCommon) initSetUp(c *C) {
 	inc.SqlSafeUpdates = 0
 	inc.EnableDropTable = true
 
-	session.SetLanguage("en-US")
+	s.defaultInc = *inc
 
 	s.remoteBackupTable = "$_$Inception_backup_information$_$"
 	s.parser = parser.New()
@@ -163,7 +188,7 @@ func (s *testCommon) tearDownTest(c *C) {
 
 	exec := `/*%s;--execute=1;--backup=0;--enable-ignore-warnings;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
 	for _, name := range strings.Split(sql.(string), "\n") {
@@ -171,7 +196,7 @@ inception_magic_commit;`
 			continue
 		}
 		n := strings.Replace(name, "'", "", -1)
-		res := s.tk.MustQueryInc(fmt.Sprintf(exec, s.getAddr(), "drop table `"+n+"`"))
+		res := s.tk.MustQueryInc(fmt.Sprintf(exec, s.getAddr(), s.useDB, "drop table `"+n+"`"))
 		// log.Info(res.Rows())
 		c.Assert(int(s.tk.Se.AffectedRows()), Equals, 2)
 		row := res.Rows()[int(s.tk.Se.AffectedRows())-1]
@@ -185,28 +210,42 @@ inception_magic_commit;`
 }
 
 func (s *testCommon) runCheck(sql string) *testkit.Result {
-
-	tk := s.tk
 	session.CheckAuditSetting(config.GetGlobalConfig())
-
 	a := `/*%s;--check=1;--backup=0;--enable-ignore-warnings;real_row_count=%v;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	return tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
+	s.rows = res.Rows()
+	return res
+}
+
+func (s *testCommon) mustCheck(c *C, sql string) *testkit.Result {
+	// session.CheckAuditSetting(config.GetGlobalConfig())
+	a := `/*%s;--check=1;--backup=0;--enable-ignore-warnings;real_row_count=%v;*/
+inception_magic_start;
+%s
+%s;
+inception_magic_commit;`
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
+	for _, row := range res.Rows() {
+		c.Assert(row[2], Not(Equals), "2", Commentf("%v", row))
+	}
+	s.rows = res.Rows()
+	return res
 }
 
 func (s *testCommon) runExec(sql string) *testkit.Result {
-	tk := s.tk
-	session.CheckAuditSetting(config.GetGlobalConfig())
-
+	// session.CheckAuditSetting(config.GetGlobalConfig())
 	a := `/*%s;--execute=1;--backup=0;--enable-ignore-warnings;real_row_count=%v;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	return tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
+	s.rows = res.Rows()
+	return res
 }
 
 func (s *testCommon) mustRunExec(c *C, sql string) *testkit.Result {
@@ -214,83 +253,90 @@ func (s *testCommon) mustRunExec(c *C, sql string) *testkit.Result {
 	session.CheckAuditSetting(config.GetGlobalConfig())
 	a := `/*%s;--execute=1;--backup=0;--enable-ignore-warnings;real_row_count=%v;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
 
 	for _, row := range res.Rows() {
 		c.Assert(row[2], Not(Equals), "2", Commentf("%v", row))
 	}
 
+	s.rows = res.Rows()
 	return res
 }
 
 func (s *testCommon) runBackup(sql string) *testkit.Result {
 	a := `/*%s;--execute=1;--backup=1;--enable-ignore-warnings;real_row_count=%v;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	return s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
+	s.rows = res.Rows()
+	return res
 }
 
 func (s *testCommon) mustRunBackup(c *C, sql string) *testkit.Result {
 	a := `/*%s;--execute=1;--backup=1;--enable-ignore-warnings;real_row_count=%v;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
 
 	// 需要成功执行
 	for _, row := range res.Rows() {
 		c.Assert(row[2], Not(Equals), "2", Commentf("%v", row))
 	}
 
+	s.rows = res.Rows()
 	return res
 }
 
 func (s *testCommon) mustRunBackupTran(c *C, sql string) *testkit.Result {
 	a := `/*%s;--execute=1;--backup=1;--enable-ignore-warnings;real_row_count=%v;--trans=3;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
 
 	// 需要成功执行
 	for _, row := range res.Rows() {
 		c.Assert(row[2], Not(Equals), "2", Commentf("%v", row))
 	}
 
+	s.rows = res.Rows()
 	return res
 }
 
 func (s *testCommon) runTranSQL(sql string, batch int) *testkit.Result {
 	a := `/*%s;--execute=1;--backup=1;--execute=1;--enable-ignore-warnings;real_row_count=%v;--trans=%d;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, batch, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, batch, s.useDB, sql))
 
+	s.rows = res.Rows()
 	return res
 }
 
 func (s *testCommon) mustrunTranSQL(c *C, sql string) *testkit.Result {
 	a := `/*%s;--execute=1;--backup=1;--execute=1;--enable-ignore-warnings;real_row_count=%v;--trans=10;*/
 inception_magic_start;
-use test_inc;
+%s
 %s;
 inception_magic_commit;`
-	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, sql))
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB, sql))
 
 	// 需要成功执行
 	for _, row := range res.Rows() {
 		c.Assert(row[2], Not(Equals), "2", Commentf("%v", row))
 	}
 
+	s.rows = res.Rows()
 	return res
 }
 
@@ -376,7 +422,6 @@ func (s *testCommon) mysqlServerVersion() error {
 
 func (s *testCommon) assertRows(c *C, rows [][]interface{}, rollbackSqls ...string) error {
 	c.Assert(len(rows), Not(Equals), 0)
-
 	inc := config.GetGlobalConfig().Inc
 	if s.db == nil || s.db.DB().Ping() != nil {
 		addr := fmt.Sprintf("%s:%s@tcp(%s:%d)/mysql?charset=utf8mb4&parseTime=True&loc=Local&maxAllowedPacket=4194304",
@@ -388,7 +433,7 @@ func (s *testCommon) assertRows(c *C, rows [][]interface{}, rollbackSqls ...stri
 			return err
 		}
 		// 禁用日志记录器，不显示任何日志
-		db.LogMode(true)
+		db.LogMode(false)
 		s.db = db
 	}
 
@@ -498,7 +543,7 @@ func (s *testCommon) assertRows(c *C, rows [][]interface{}, rollbackSqls ...stri
 		result = append(result, result1...)
 	}
 
-	c.Assert(len(result), Equals, len(rollbackSqls), Commentf("%v", result))
+	c.Assert(len(result), Equals, len(rollbackSqls), Commentf("%v", rows))
 
 	for i := range result {
 		c.Assert(result[i], Equals, rollbackSqls[i], Commentf("%v", result))
@@ -735,4 +780,9 @@ func (s *testCommon) parserStmt(sql string) ast.StmtNode {
 		return stmtNode
 	}
 	return nil
+}
+
+func (s *testCommon) reset() {
+	config.GetGlobalConfig().Inc = s.defaultInc
+	log.SetLevel(log.ErrorLevel)
 }

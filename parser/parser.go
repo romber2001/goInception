@@ -30,6 +30,7 @@ package parser
 import __yyfmt__ "fmt"
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/hanchuanchuan/goInception/ast"
@@ -8722,7 +8723,7 @@ yynewstate:
 		{
 			escape := yyS[yypt-0].item.(string)
 			if len(escape) > 1 {
-				yylex.Errorf("Incorrect arguments %s to ESCAPE", escape)
+				yylex.AppendError(ErrWrongArguments.GenWithStackByArgs("ESCAPE"))
 				return 1
 			} else if len(escape) == 0 {
 				escape = "\\"
@@ -9117,7 +9118,7 @@ yynewstate:
 			// See https://dev.mysql.com/doc/refman/5.7/en/charset-literal.html
 			co, err := charset.GetDefaultCollation(yyS[yypt-1].ident)
 			if err != nil {
-				yylex.Errorf("Get collation error for charset: %s", yyS[yypt-1].ident)
+				yylex.AppendError(yylex.Errorf("Get collation error for charset: %s", yyS[yypt-1].ident))
 				return 1
 			}
 			expr := ast.NewValueExpr(yyS[yypt-0].ident)
@@ -11728,10 +11729,8 @@ yynewstate:
 		{
 			x := types.NewFieldType(yyS[yypt-1].item.(byte))
 			x.Flen = yyS[yypt-0].item.(int)
-			if x.Flen == types.UnspecifiedLength || x.Flen == 0 {
+			if x.Flen == types.UnspecifiedLength {
 				x.Flen = 1
-			} else if x.Flen > 64 {
-				yylex.Errorf("invalid field length %d for bit type, must in [1, 64]", x.Flen)
 			}
 			parser.yyVAL.item = x
 		}
@@ -12008,7 +12007,8 @@ yynewstate:
 			x := types.NewFieldType(mysql.TypeYear)
 			x.Flen = yyS[yypt-1].item.(int)
 			if x.Flen != types.UnspecifiedLength && x.Flen != 4 {
-				yylex.Errorf("Supports only YEAR or YEAR(4) column.")
+				// yylex.AppendError(ErrInvalidYearColumnLength.GenWithStackByArgs())
+				yylex.AppendError(fmt.Errorf("Supports only YEAR or YEAR(4) column."))
 				return -1
 			}
 			parser.yyVAL.item = x

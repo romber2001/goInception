@@ -28,6 +28,14 @@ import (
 
 var _ = Suite(&testSessionIncSuite{})
 
+type SQLError = session.SQLError
+
+// SQLAudit 审核类
+type SQLAudit struct {
+	sql    string
+	errors []*SQLError
+}
+
 func TestAudit(t *testing.T) {
 	TestingT(t)
 }
@@ -35,14 +43,21 @@ func TestAudit(t *testing.T) {
 type testSessionIncSuite struct {
 	testCommon
 
-	rows [][]interface{}
+	audits []SQLAudit
+}
+
+func (s *testSessionIncSuite) add(sql string, errors ...*SQLError) {
+	s.audits = append(s.audits, SQLAudit{
+		sql:    sql,
+		errors: errors,
+	})
 }
 
 func (s *testSessionIncSuite) SetUpSuite(c *C) {
 
 	s.initSetUp(c)
 
-	inc := &config.GetGlobalConfig().Inc
+	inc := &s.defaultInc
 	inc.EnableFingerprint = true
 	inc.SqlSafeUpdates = 0
 	inc.EnableDropTable = true
@@ -53,6 +68,7 @@ func (s *testSessionIncSuite) TearDownSuite(c *C) {
 }
 
 func (s *testSessionIncSuite) TearDownTest(c *C) {
+	s.reset()
 	s.tearDownTest(c)
 }
 
@@ -89,6 +105,46 @@ func (s *testSessionIncSuite) testErrorCode(c *C, sql string, errors ...*session
 	s.rows = res.Rows()
 }
 
+func (s *testSessionIncSuite) testSQLError(c *C, sql string, errors ...*session.SQLError) {
+	if s.tk == nil {
+		s.tk = testkit.NewTestKitWithInit(c, s.store)
+	}
+
+	res := s.runCheck(sql)
+
+	errCode := 0
+	if len(errors) > 0 {
+		for _, e := range errors {
+			level := session.GetErrorLevel(e.Code)
+			if int(level) > errCode {
+				errCode = int(level)
+			}
+		}
+	}
+
+	allErrors := []string{}
+	for _, row := range res.Rows()[1:] {
+		if v, ok := row[4].(string); ok {
+			v = strings.TrimSpace(v)
+			if v != "<nil>" {
+				allErrors = append(allErrors, v)
+			}
+		}
+	}
+
+	errMsgs := []string{}
+	for _, e := range errors {
+		errMsgs = append(errMsgs, e.Error())
+	}
+
+	c.Assert(len(errMsgs), Equals, len(allErrors), Commentf("%v", allErrors))
+
+	for index, err := range allErrors {
+		c.Assert(err, Equals, errMsgs[index], Commentf("%v", res.Rows()))
+	}
+
+}
+
 func (s *testSessionIncSuite) testAffectedRows(c *C, affectedRows ...int) {
 	if len(s.rows) == 0 {
 		return
@@ -97,6 +153,84 @@ func (s *testSessionIncSuite) testAffectedRows(c *C, affectedRows ...int) {
 	for i, affectedRow := range affectedRows {
 		row := s.rows[len(s.rows)-(count-i)]
 		c.Assert(row[6], Equals, strconv.Itoa(affectedRow), Commentf("%v", row))
+	}
+}
+
+func (s *testSessionIncSuite) runAudit(c *C) {
+
+	c.Assert(len(s.audits), Not(Equals), 0)
+
+	var sqls []string
+	for _, a := range s.audits {
+		sqls = append(sqls, a.sql)
+	}
+
+	session.CheckAuditSetting(config.GetGlobalConfig())
+	a := `/*%s;--check=1;--backup=0;--enable-ignore-warnings;real_row_count=%v;*/
+inception_magic_start;
+%s
+%s;
+inception_magic_commit;`
+	res := s.tk.MustQueryInc(fmt.Sprintf(a, s.getAddr(), s.realRowCount, s.useDB,
+		strings.Join(sqls, ";\n"),
+	))
+	s.rows = res.Rows()
+	rows := s.rows
+
+	c.Assert(len(s.audits), Equals, len(rows)-1)
+
+	for index, row := range rows {
+		errors := s.audits[index].errors
+		errCode := 0
+		if len(errors) > 0 {
+			for _, e := range errors {
+				level := session.GetErrorLevel(e.Code)
+				if int(level) > errCode {
+					errCode = int(level)
+				}
+			}
+		}
+
+		if errCode > 0 {
+			errMsgs := []string{}
+			for _, e := range errors {
+				errMsgs = append(errMsgs, e.Error())
+			}
+			c.Assert(row[4], Equals, strings.Join(errMsgs, "\n"), Commentf("%v", rows))
+		}
+		c.Assert(row[2], Equals, strconv.Itoa(errCode), Commentf("%v", row))
+	}
+
+	s.audits = nil
+}
+
+func (s *testCommon) assertAudit(c *C,
+	rows [][]interface{},
+	allErrors ...[]*SQLError) {
+
+	c.Assert(len(rows), Not(Equals), 0)
+	c.Assert(len(rows), Equals, len(allErrors), Commentf("%v", rows))
+
+	for index, row := range rows {
+		errors := allErrors[index]
+		errCode := 0
+		if len(errors) > 0 {
+			for _, e := range errors {
+				level := session.GetErrorLevel(e.Code)
+				if int(level) > errCode {
+					errCode = int(level)
+				}
+			}
+		}
+
+		if errCode > 0 {
+			errMsgs := []string{}
+			for _, e := range errors {
+				errMsgs = append(errMsgs, e.Error())
+			}
+			c.Assert(row[4], Equals, strings.Join(errMsgs, "\n"), Commentf("%v", rows))
+		}
+		c.Assert(row[2], Equals, strconv.Itoa(errCode), Commentf("%v", row))
 	}
 }
 
@@ -116,13 +250,26 @@ func (s *testSessionIncSuite) TestBegin(c *C) {
 }
 
 func (s *testSessionIncSuite) TestNoSourceInfo(c *C) {
-	res := s.tk.MustQueryInc("inception_magic_start;\ncreate table t1(id int);")
+	res := s.tk.MustQueryInc(`inception_magic_start;
+	create table t1(id int);`)
 
 	c.Assert(int(s.tk.Se.AffectedRows()), Equals, 1)
 
 	for _, row := range res.Rows() {
 		c.Assert(row[2], Equals, "2")
-		c.Assert(row[4], Equals, "Invalid source infomation.")
+		c.Assert(row[4], Equals, "Invalid source infomation(inception语法格式错误).")
+	}
+}
+
+func (s *testSessionIncSuite) TestNoSourceInfo2(c *C) {
+	res := s.tk.MustQueryInc(`/*--check=1;*/
+	inception_magic_start;create table t1(id int)`)
+
+	c.Assert(int(s.tk.Se.AffectedRows()), Equals, 1)
+
+	for _, row := range res.Rows() {
+		c.Assert(row[2], Equals, "2")
+		c.Assert(row[4], Equals, "Invalid source infomation(主机名为空,端口为0,用户名为空).")
 	}
 }
 
@@ -150,11 +297,6 @@ inception_magic_start;use test_inc;create table t1(id int);`, s.getAddr()))
 }
 
 func (s *testSessionIncSuite) TestCreateTable(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	sql := ""
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
@@ -203,15 +345,17 @@ func (s *testSessionIncSuite) TestCreateTable(c *C) {
 
 	// char列建议
 	config.GetGlobalConfig().Inc.MaxCharLength = 100
-	sql = `create table t1(id int,c1 char(200));`
+	sql = `create table t1(id int,c1 char(200),c2 char(100));`
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_CHAR_TO_VARCHAR_LEN, "c1"))
 
+	config.GetGlobalConfig().Inc.MaxCharLength = 0
+	sql = `create table t1(id int,c1 char(200));`
+	s.testErrorCode(c, sql)
+
 	// 主键的默认值为函数
-	config.GetGlobalConfig().Inc.CheckPrimaryKey = true
 	sql = "create table t1(c1 datetime(6) not null default current_timestamp(6) primary key);"
 	s.testErrorCode(c, sql)
-	config.GetGlobalConfig().Inc.CheckPrimaryKey = false
 
 	// 关键字
 	config.GetGlobalConfig().Inc.EnableIdentiferKeyword = false
@@ -242,10 +386,21 @@ func (s *testSessionIncSuite) TestCreateTable(c *C) {
 	c.Assert(row[2], Equals, "0")
 
 	// 无效默认值
-	res = s.runCheck("create table t1(id int,c1 int default '');")
-	row = res.Rows()[1]
-	c.Assert(row[2], Equals, "2")
-	c.Assert(row[4], Equals, "Invalid default value for column 'c1'.")
+	config.GetGlobalConfig().Inc.EnableEnumSetBit = true
+	sql = "create table t1(id int,c1 int default '');"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DEFAULT, "c1"))
+
+	// sql = "create table t1(id int,c1 bit default '');"
+	// s.testErrorCode(c, sql,
+	// 	session.NewErr(session.ER_INVALID_DEFAULT, "c1"))
+
+	sql = "create table t1(id int,c1 bit default '0');"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DEFAULT, "c1"))
+
+	sql = "create table t1(id int,c1 bit default b'0');"
+	s.testErrorCode(c, sql)
 
 	// blob/text字段
 	config.GetGlobalConfig().Inc.EnableBlobType = false
@@ -687,23 +842,26 @@ primary key(id)) comment 'test';`
 	sql = "create table test_error_code_3(a text, unique (a(3073)));"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_WRONG_NAME_FOR_INDEX, "NULL", "test_error_code_3"),
-		session.NewErr(session.ER_INDEX_NAME_UNIQ_PREFIX, "", "test_error_code_3"),
+		session.NewErr(session.ER_INDEX_NAME_UNIQ_PREFIX, "",
+			config.GetGlobalConfig().Inc.UniqIndexPrefix, "test_error_code_3"),
 		session.NewErr(session.ER_TOO_LONG_KEY, "", indexMaxLength))
 
 	sql = "create table test_error_code_3(a text, key (a(3073)));"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_WRONG_NAME_FOR_INDEX, "NULL", "test_error_code_3"),
-		session.NewErr(session.ER_INDEX_NAME_IDX_PREFIX, "", "test_error_code_3"),
+		session.NewErr(session.ER_INDEX_NAME_IDX_PREFIX, "",
+			config.GetGlobalConfig().Inc.IndexPrefix, "test_error_code_3"),
 		session.NewErr(session.ER_TOO_LONG_KEY, "", indexMaxLength))
+
+	config.GetGlobalConfig().Inc.TablePrefix = "t_"
+	sql = "create table t1(id int primary key);"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_TABLE_PREFIX,
+			config.GetGlobalConfig().Inc.TablePrefix))
 
 }
 
 func (s *testSessionIncSuite) TestDropTable(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.EnableDropTable = false
 	sql := ""
 	sql = "create table t1(id int);drop table t1;"
@@ -727,11 +885,6 @@ func (s *testSessionIncSuite) TestDropTable(c *C) {
 }
 
 func (s *testSessionIncSuite) TestAlterTableAddColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
 	config.GetGlobalConfig().Inc.EnableDropTable = true
@@ -777,16 +930,12 @@ func (s *testSessionIncSuite) TestAlterTableAddColumn(c *C) {
 		session.NewErr(session.ER_CHAR_TO_VARCHAR_LEN, "c1"))
 
 	// 字符集
-	res = s.runCheck(`drop table if exists t1;create table t1(id int);
-		alter table t1 add column c1 varchar(20) character set utf8;
-		alter table t1 add column c2 varchar(20) COLLATE utf8_bin;`)
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-2]
-	c.Assert(row[2], Equals, "1")
-	c.Assert(row[4], Equals, "Not Allowed set charset for column 't1.c1'.")
-
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
-	c.Assert(row[2], Equals, "1")
-	c.Assert(row[4], Equals, "Not Allowed set charset for column 't1.c2'.")
+	sql = `drop table if exists t1;create table t1(id int);
+        alter table t1 add column c1 varchar(20) character set utf8;
+        alter table t1 add column c2 varchar(20) COLLATE utf8_bin;`
+	s.testSQLError(c, sql,
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c1"),
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c2"))
 
 	// 关键字
 	config.GetGlobalConfig().Inc.EnableIdentiferKeyword = false
@@ -815,6 +964,15 @@ func (s *testSessionIncSuite) TestAlterTableAddColumn(c *C) {
 	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
 	c.Assert(row[2], Equals, "2")
 	c.Assert(row[4], Equals, "Invalid default value for column 'c1'.")
+
+	sql = "drop table if exists t1;create table t1(id int);alter table t1 add column c1 int default '';"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DEFAULT, "c1"))
+
+	config.GetGlobalConfig().Inc.EnableEnumSetBit = true
+	sql = "drop table if exists t1;create table t1(id int);alter table t1 add column c1 bit default '0';"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_INVALID_DEFAULT, "c1"))
 
 	// blob/text字段
 	config.GetGlobalConfig().Inc.EnableBlobType = false
@@ -907,11 +1065,6 @@ func (s *testSessionIncSuite) TestAlterTableAddColumn(c *C) {
 }
 
 func (s *testSessionIncSuite) TestAlterTableAlterColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	res := s.runCheck("create table t1(id int);alter table t1 alter column id set default '';")
 	row := res.Rows()[int(s.tk.Se.AffectedRows())-1]
 	c.Assert(row[2], Equals, "2")
@@ -929,11 +1082,6 @@ func (s *testSessionIncSuite) TestAlterTableAlterColumn(c *C) {
 }
 
 func (s *testSessionIncSuite) TestAlterTableModifyColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
 
@@ -979,21 +1127,17 @@ func (s *testSessionIncSuite) TestAlterTableModifyColumn(c *C) {
 		session.NewErr(session.ER_CHAR_TO_VARCHAR_LEN, "c1"))
 
 	// 字符集
-	res = s.runCheck(`create table t1(id int,c1 varchar(20));
+	sql = `create table t1(id int,c1 varchar(20));
 		alter table t1 modify column c1 varchar(20) character set utf8;
-		alter table t1 modify column c1 varchar(20) COLLATE utf8_bin;`)
-	row := res.Rows()[int(s.tk.Se.AffectedRows())-2]
-	c.Assert(row[2], Equals, "1")
-	c.Assert(row[4], Equals, "Not Allowed set charset for column 't1.c1'.")
-
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
-	c.Assert(row[2], Equals, "1")
-	c.Assert(row[4], Equals, "Not Allowed set charset for column 't1.c1'.")
+		alter table t1 modify column c1 varchar(20) COLLATE utf8_bin;`
+	s.testSQLError(c, sql,
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c1"),
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c1"))
 
 	// 列注释
 	config.GetGlobalConfig().Inc.CheckColumnComment = true
 	res = s.runCheck("create table t1(id int,c1 varchar(10));alter table t1 modify column c1 varchar(20);")
-	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
+	row := res.Rows()[int(s.tk.Se.AffectedRows())-1]
 	c.Assert(row[2], Equals, "1")
 	c.Assert(row[4], Equals, "Column 'c1' in table 't1' have no comments.")
 
@@ -1130,19 +1274,28 @@ func (s *testSessionIncSuite) TestAlterTableModifyColumn(c *C) {
 
 	sql = "alter table t1 modify c1 int not null;alter table t1 add primary key(id,c1);"
 	s.testErrorCode(c, sql)
+}
+
+func (s *testSessionIncSuite) TestAlterTableChangeColumn(c *C) {
+	var sql string
+	config.GetGlobalConfig().Inc.CheckColumnComment = false
+	config.GetGlobalConfig().Inc.CheckTableComment = false
+
+	s.mustCheck(c, "create table t1(id int,c1 int);alter table t1 modify column c1 int first;")
+
+	s.mustCheck(c, "create table t1(id int,c1 int);alter table t1 modify column id int after c1;")
 
 	config.GetGlobalConfig().Inc.EnableChangeColumn = false
 
 	sql = "create table t1(id int primary key,c1 int,c2 int);alter table t1 change column c1 c3 int after id"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ErCantChangeColumn, "c1"))
+
+	config.GetGlobalConfig().Inc.EnableChangeColumn = true
+
 }
 
 func (s *testSessionIncSuite) TestAlterTableDropColumn(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 	sql := ""
 	sql = "create table t1(id int,c1 int);alter table t1 drop column c2;"
 	s.testErrorCode(c, sql,
@@ -1162,11 +1315,6 @@ func (s *testSessionIncSuite) TestAlterTableDropColumn(c *C) {
 }
 
 func (s *testSessionIncSuite) TestInsert(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckInsertField = false
 	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
 
@@ -1379,11 +1527,6 @@ insert into t2 select id from t1;`
 }
 
 func (s *testSessionIncSuite) TestSelect(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.EnableSelectStar = false
 
 	s.mustRunExec(c, "drop table if exists t1;create table t1(id int,c1 integer);")
@@ -1461,13 +1604,33 @@ func (s *testSessionIncSuite) TestUpdate(c *C) {
 	sql = "create table t1(id int,c1 int);update t1 set c1 = 1;"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_NO_WHERE_CONDITION))
-	config.GetGlobalConfig().Inc.CheckDMLWhere = false
 
-	// where
-	config.GetGlobalConfig().Inc.CheckDMLWhere = true
-	sql = "create table t1(id int,c1 int);create table t2(id int,c1 int);update t1 join t2 set t1.c1 = 1 where t1.id=1;"
+	sql = `create table t1(id int,c1 int);
+	create table t2(id int,c1 int);`
+	s.mustRunExec(c, sql)
+
+	sql = `update t1 join t2 set t1.c1 = 1;`
 	s.testErrorCode(c, sql,
-		session.NewErr(session.ErrJoinNoOnCondition))
+		session.NewErr(session.ErrJoinNoOnCondition),
+		session.NewErr(session.ER_NO_WHERE_CONDITION))
+
+	sql = `update t1,t2 set t1.c1 = 1;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ErrJoinNoOnCondition),
+		session.NewErr(session.ER_NO_WHERE_CONDITION))
+
+	sql = `update t1 NATURAL join t2  set t1.c1 = 1 ;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_NO_WHERE_CONDITION))
+
+	sql = `create table t1(id int,c1 int);
+		create table t2(id int,c1 int);
+		update t1 join t2 using(id) set t1.c1 = 1 ;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_NO_WHERE_CONDITION))
+
+	sql = `update t1,t2 set t1.c1 = 1 where t1.id=1;`
+	s.testErrorCode(c, sql)
 	config.GetGlobalConfig().Inc.CheckDMLWhere = false
 
 	// limit
@@ -1486,7 +1649,7 @@ func (s *testSessionIncSuite) TestUpdate(c *C) {
 
 	// 受影响行数
 	s.realRowCount = false
-	res := s.runCheck("create table t1(id int,c1 int);update t1 set c1 = 1;")
+	res := s.runCheck("drop table if exists t1,t2;create table t1(id int,c1 int);update t1 set c1 = 1;")
 	row := res.Rows()[int(s.tk.Se.AffectedRows())-1]
 	c.Assert(row[2], Equals, "0")
 	c.Assert(row[6], Equals, "0")
@@ -1701,11 +1864,6 @@ WHERE tt1.id=1;`
 }
 
 func (s *testSessionIncSuite) TestDelete(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckInsertField = false
 	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
 
@@ -1804,11 +1962,6 @@ func (s *testSessionIncSuite) TestDelete(c *C) {
 }
 
 func (s *testSessionIncSuite) TestCreateDataBase(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.EnableDropDatabase = false
 	// 不存在
 	sql = "drop database if exists test1111111111111111111;"
@@ -2020,11 +2173,6 @@ func (s *testSessionIncSuite) TestCreateView(c *C) {
 }
 
 func (s *testSessionIncSuite) TestAlterTableAddIndex(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
 
@@ -2082,11 +2230,6 @@ func (s *testSessionIncSuite) TestAlterTableAddIndex(c *C) {
 }
 
 func (s *testSessionIncSuite) TestAlterTableDropIndex(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
 
@@ -2100,11 +2243,6 @@ func (s *testSessionIncSuite) TestAlterTableDropIndex(c *C) {
 }
 
 func (s *testSessionIncSuite) TestAlterTable(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
 	config.GetGlobalConfig().Inc.CheckTableComment = false
 	config.GetGlobalConfig().Inc.EnableDropTable = true
@@ -2148,14 +2286,46 @@ func (s *testSessionIncSuite) TestAlterTable(c *C) {
 	alter table t1 drop column c4; `
 	s.testErrorCode(c, sql)
 
+	// 列字符集&排序规则
+	config.GetGlobalConfig().Inc.EnableColumnCharset = false
+	sql = `drop table if exists t1;
+    create table t1(id int primary key);
+    alter table t1 add column c4 varchar(22) charset utf8;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c4"))
+
+	sql = `drop table if exists t1;
+    create table t1(id int primary key);
+    alter table t1 add column c4 varchar(22) collate utf8_bin;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c4"))
+
+	sql = `drop table if exists t1;
+    create table t1(id int primary key);
+    alter table t1 add column c4 varchar(22) charset utf8 collate utf8_bin;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c4"),
+		session.NewErr(session.ER_CHARSET_ON_COLUMN, "t1", "c4"))
+
+	config.GetGlobalConfig().Inc.EnableColumnCharset = true
+	config.GetGlobalConfig().Inc.SupportCharset = "utf8mb4"
+	sql = `drop table if exists t1;
+    create table t1(id int primary key);
+    alter table t1 add column c4 varchar(22) charset utf8 collate utf8_bin;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ErrCharsetNotSupport, "utf8mb4"))
+
+	config.GetGlobalConfig().Inc.SupportCharset = "utf8"
+	config.GetGlobalConfig().Inc.SupportCollation = "utf8_bin"
+	sql = `drop table if exists t1;
+    create table t1(id int primary key);
+    alter table t1 add column c4 varchar(22) charset utf8 collate utf8mb4_bin;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ErrCollationNotSupport, "utf8_bin"))
+
 }
 
 func (s *testSessionIncSuite) TestCreateTablePrimaryKey(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	sql := ""
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
@@ -2200,11 +2370,6 @@ func (s *testSessionIncSuite) TestCreateTablePrimaryKey(c *C) {
 }
 
 func (s *testSessionIncSuite) TestTableCharsetCollation(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	sql := ""
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
@@ -2261,11 +2426,6 @@ func (s *testSessionIncSuite) TestTableCharsetCollation(c *C) {
 }
 
 func (s *testSessionIncSuite) TestForeignKey(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	sql := ""
 
 	config.GetGlobalConfig().Inc.EnableForeignKey = false
@@ -2305,26 +2465,17 @@ func (s *testSessionIncSuite) TestForeignKey(c *C) {
 
 }
 func (s *testSessionIncSuite) TestZeroDate(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	sql := ""
 
 	config.GetGlobalConfig().Inc.EnableZeroDate = false
-	sql = `create table t4 (id int unsigned not null auto_increment primary key comment 'primary key', a datetime not null default 0 comment 'a') comment 'test';`
+	sql = `create table t4 (id int unsigned not null auto_increment primary key
+		comment 'primary key', a datetime not null default 0 comment 'a') comment 'test';`
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_INVALID_DEFAULT, "a"))
 	config.GetGlobalConfig().Inc.EnableZeroDate = true
 }
 
 func (s *testSessionIncSuite) TestTimestampType(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	sql := ""
 
 	config.GetGlobalConfig().Inc.EnableTimeStampType = false
@@ -2336,22 +2487,12 @@ func (s *testSessionIncSuite) TestTimestampType(c *C) {
 }
 
 func (s *testSessionIncSuite) TestAlterNoOption(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	sql := `drop table if exists t1;create table t1(id int,c1 int,key ix(c1));alter table t1;`
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_NOT_SUPPORTED_YET))
 }
 
 func (s *testSessionIncSuite) TestFloatDouble(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckFloatDouble = true
 	sql := `drop table if exists t1;create table t1(id int,c1 float,key ix(c1));`
 	s.testErrorCode(c, sql,
@@ -2364,11 +2505,6 @@ func (s *testSessionIncSuite) TestFloatDouble(c *C) {
 }
 
 func (s *testSessionIncSuite) TestIdentifierUpper(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	config.GetGlobalConfig().Inc.CheckIdentifierUpper = true
 	sql := `drop table if exists hello;create table HELLO(ID int,C1 float, C2 double,key IDX_C1(C1),UNIQUE INDEX uniq_A(C2));`
 	s.testErrorCode(c, sql,
@@ -2379,11 +2515,6 @@ func (s *testSessionIncSuite) TestIdentifierUpper(c *C) {
 }
 
 func (s *testSessionIncSuite) TestMaxKeys(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	//er_too_many_keys
 	config.GetGlobalConfig().Inc.MaxKeys = 2
 	sql = "drop table if exists t1; create table t1(id int primary key,name varchar(10),age varchar(10));alter table t1 add index idx_test(id),add index idx_test2(name);"
@@ -2416,39 +2547,42 @@ func (s *testSessionIncSuite) TestMaxKeys(c *C) {
 }
 
 func (s *testSessionIncSuite) TestSetStmt(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
 
-	sql = "set names abc;"
-	s.testErrorCode(c, sql,
-		session.NewErr(session.ErrCharsetNotSupport, "utf8,utf8mb4"))
+	sql = `set names abc;
+		set names '';
+		set names utf8;
+		set names utf8mb4;
+		set autocommit = 1;
+		`
+	s.runCheck(sql)
+	s.assertAudit(c, s.rows[1:],
+		[]*SQLError{
+			session.NewErr(session.ErrCharsetNotSupport, "utf8,utf8mb4"),
+		},
+		[]*SQLError{
+			session.NewErr(session.ErrCharsetNotSupport, "utf8,utf8mb4"),
+		},
+		nil,
+		nil,
+		[]*SQLError{
+			session.NewErr(session.ER_NOT_SUPPORTED_YET),
+		})
 
-	sql = "set names '';"
-	s.testErrorCode(c, sql,
-		session.NewErr(session.ErrCharsetNotSupport, "utf8,utf8mb4"))
-
-	sql = "set names utf8;"
-	s.testErrorCode(c, sql)
-
-	sql = "set names utf8mb4;"
-	s.testErrorCode(c, sql)
-
-	sql = "set autocommit = 1;"
-	s.testErrorCode(c, sql,
-		session.NewErr(session.ER_NOT_SUPPORTED_YET))
+	// s.add(`set names abc`, session.NewErr(session.ErrCharsetNotSupport, "utf8,utf8mb4"))
+	// s.add(`set names ''`, session.NewErr(session.ErrCharsetNotSupport, "utf8,utf8mb4"))
+	// s.add(`set names utf8`)
+	// s.add(`set names utf8mb4`)
+	// s.add(`set autocommit = 1`, session.NewErr(session.ER_NOT_SUPPORTED_YET))
+	// s.runAudit(c)
 }
 
 func (s *testSessionIncSuite) TestMergeAlterTable(c *C) {
-	saved := config.GetGlobalConfig().Inc
-	defer func() {
-		config.GetGlobalConfig().Inc = saved
-	}()
-
 	//er_alter_table_once
 	config.GetGlobalConfig().Inc.MergeAlterTable = true
-	sql = "drop table if exists t1; create table t1(id int primary key,name varchar(10));alter table t1 add age varchar(10);alter table t1 add sex varchar(10);"
+	sql = `drop table if exists t1;
+	create table t1(id int primary key,name varchar(10));
+	alter table t1 add age varchar(10);
+	alter table t1 add sex varchar(10);`
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_ALTER_TABLE_ONCE, "t1"))
 
@@ -2463,6 +2597,7 @@ func (s *testSessionIncSuite) TestMergeAlterTable(c *C) {
 	sql = "drop table if exists t1; create table t1(id int primary key,name varchar(10));alter table t1 change name name varchar(10);alter table t1 change name name varchar(10);"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_ALTER_TABLE_ONCE, "t1"))
+
 }
 
 func (s *testSessionIncSuite) TestNewRewrite(c *C) {
@@ -2558,4 +2693,170 @@ func (s *testSessionIncSuite) TestNewRewrite(c *C) {
 		newSql = rw.TestSelect2Count()
 		c.Assert(newSql, Equals, row.countSql)
 	}
+}
+
+func (s *testSessionIncSuite) TestGetAlterTablePostPart(c *C) {
+	sqls := []struct {
+		sql      string
+		outPT    string
+		outGhost string
+	}{
+		{
+			"alter table tb_archery add unique index uniq_test_ghost_3 (test_ghost_3);",
+			"ADD UNIQUE \\`uniq_test_ghost_3\\`(\\`test_ghost_3\\`)",
+			"ADD UNIQUE `uniq_test_ghost_3`(`test_ghost_3`)",
+		},
+		{
+			"alter table tb_archery add COLUMN c1 varchar(100) default null comment '!@#$%^&*(){}:<>?,./' after id123;",
+			"ADD COLUMN \\`c1\\` VARCHAR(100) DEFAULT NULL COMMENT '!@#\\$%^&*(){}:<>?,./' AFTER \\`id123\\`",
+			"ADD COLUMN `c1` VARCHAR(100) DEFAULT NULL COMMENT '!@#$%^&*(){}:<>?,./' AFTER `id123`",
+		},
+		{
+			"alter table tb_archery add primary key(id);",
+			"ADD PRIMARY KEY(\\`id\\`)",
+			"ADD PRIMARY KEY(`id`)",
+		},
+		{
+			"alter table tb_archery add unique key uniq_1(c1);",
+			"ADD UNIQUE \\`uniq_1\\`(\\`c1\\`)",
+			"ADD UNIQUE `uniq_1`(`c1`)",
+		},
+		{
+			"alter table tb_archery alter column c1 drop default;",
+			"ALTER COLUMN \\`c1\\` DROP DEFAULT",
+			"ALTER COLUMN `c1` DROP DEFAULT",
+		},
+		{
+			"alter table tb_archery default character set utf8 collate utf8_bin;",
+			"CONVERT TO CHARACTER SET UTF8 COLLATE UTF8_BIN",
+			"CONVERT TO CHARACTER SET UTF8 COLLATE UTF8_BIN",
+		},
+		{
+			"alter table tb_archery collate      = utf8_bin;",
+			"DEFAULT COLLATE = UTF8_BIN",
+			"DEFAULT COLLATE = UTF8_BIN",
+		},
+		{
+			"alter table t1 modify c1 varchar(100) character set utf8 collate utf8_bin;",
+			"MODIFY COLUMN \\`c1\\` VARCHAR(100) CHARACTER SET UTF8 COLLATE utf8_bin",
+			"MODIFY COLUMN `c1` VARCHAR(100) CHARACTER SET UTF8 COLLATE utf8_bin",
+		},
+		{
+			"alter table t1 modify column c1 varchar(100) collate utf8_bin;",
+			"MODIFY COLUMN \\`c1\\` VARCHAR(100) COLLATE utf8_bin",
+			"MODIFY COLUMN `c1` VARCHAR(100) COLLATE utf8_bin",
+		},
+	}
+
+	for _, row := range sqls {
+		out := s.session.GetAlterTablePostPart(row.sql, true)
+		c.Assert(out, Equals, row.outPT, Commentf("%v", row.sql))
+
+		out = s.session.GetAlterTablePostPart(row.sql, false)
+		c.Assert(out, Equals, row.outGhost, Commentf("%v", row.sql))
+	}
+}
+
+// TestDisplayWidth 测试列指定长度参数
+func (s *testSessionIncSuite) TestDisplayWidth(c *C) {
+	sql := ""
+	config.GetGlobalConfig().Inc.CheckColumnComment = false
+	config.GetGlobalConfig().Inc.CheckTableComment = false
+	config.GetGlobalConfig().Inc.EnableEnumSetBit = true
+
+	s.mustRunExec(c, "drop table if exists t1;")
+	// 数据类型 警告
+	sql = `create table t1(c1 bit(100),
+	c2 tinyint(1000),
+	c3 smallint(1000),
+	c4 mediumint(1000),
+	c5 int(1000),
+	c6 bigint(1000) );`
+	s.testErrorCode(c, sql,
+		session.NewErrf("Too big display width for column '%s' (max = 64).", "c1"),
+		session.NewErrf("Too big display width for column '%s' (max = 255).", "c2"),
+		session.NewErrf("Too big display width for column '%s' (max = 255).", "c3"),
+		session.NewErrf("Too big display width for column '%s' (max = 255).", "c4"),
+		session.NewErrf("Too big display width for column '%s' (max = 255).", "c5"),
+		session.NewErrf("Too big display width for column '%s' (max = 255).", "c6"),
+	)
+
+	// 数据类型 警告
+	sql = `create table t1(id int);
+	alter table t1 add column c1 tinyint(1000);
+	`
+	s.testErrorCode(c, sql,
+		session.NewErrf("Too big display width for column '%s' (max = 255).", "c1"))
+
+}
+
+// TestSetVariables 设置会话级变量进行审核
+func (s *testSessionIncSuite) TestSetSessionVariables(c *C) {
+	sql := ""
+
+	s.mustRunExec(c, "drop table if exists t1;")
+
+	config.GetGlobalConfig().Inc.CheckTableComment = true
+	sql = `create table t1(id int primary key);`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_TABLE_MUST_HAVE_COMMENT, "t1"))
+
+	sql = `inception set check_table_comment = 0;
+	create table t1(id int primary key);`
+	s.testErrorCode(c, sql)
+
+	sql = `inception set check_table_comment = "123";
+	create table t1(id int primary key);`
+
+	s.testSQLError(c, sql,
+		session.NewErrf("[variable:1231]Variable 'check_table_comment' can't be set to the value of '123'."),
+		session.NewErr(session.ER_TABLE_MUST_HAVE_COMMENT, "t1"))
+
+	sql = `inception set level er_table_must_have_comment = 2;`
+	s.testSQLError(c, sql,
+		session.NewErrf("暂不支持会话级的自定义审核级别."))
+
+	sql = `inception set global check_table_comment = 1;`
+	s.testSQLError(c, sql,
+		session.NewErrf("全局变量仅支持单独设置."))
+
+	sql = `inception set lang = 'zh_cn';
+		create table t1(id int primary key);
+		inception set lang = 'en_us';
+		create table t2(id int primary key);`
+	s.testSQLError(c, sql,
+		session.NewErrf("表 't1' 需要设置注释."),
+		session.NewErrf("Set comments for table 't2'."))
+
+}
+
+// TestSetVariables 设置会话级变量进行审核
+func (s *testSessionIncSuite) TestBlobAndText(c *C) {
+	sql := ""
+
+	s.mustRunExec(c, "drop table if exists t1,t2;")
+
+	config.GetGlobalConfig().Inc.EnableBlobType = false
+	sql = `create table t1(id int primary key,
+		c1 tinyblob ,
+		c2 blob,
+		c3 mediumblob,
+		c4 longblob);`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c1"),
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c2"),
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c3"),
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c4"))
+
+	sql = `create table t2(id int primary key,
+			c1 tinytext ,
+			c2 text,
+			c3 mediumtext,
+			c4 longtext);`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c1"),
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c2"),
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c3"),
+		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c4"))
+
 }
