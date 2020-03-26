@@ -599,7 +599,7 @@ func (s *testSessionIncSuite) TestCreateTable(c *C) {
 	config.GetGlobalConfig().Inc.EnableNullIndexName = false
 
 	indexMaxLength := 767
-	if s.DBVersion >= 50700 {
+	if s.innodbLargePrefix {
 		indexMaxLength = 3072
 	}
 
@@ -622,7 +622,7 @@ func (s *testSessionIncSuite) TestCreateTable(c *C) {
 		session.NewErr(session.ER_TOO_LONG_KEY, "uq_1", indexMaxLength))
 
 	// ----------------- 索引长度审核 varchar ----------------------
-	if indexMaxLength == 3072 {
+	if s.innodbLargePrefix {
 		sql = "create table test_error_code_3(c1 int primary key,c2 varchar(1024),c3 int, key uq_1(c2,c3)) default charset utf8;"
 		s.testErrorCode(c, sql,
 			session.NewErr(session.ER_TOO_LONG_KEY, "uq_1", indexMaxLength))
@@ -639,12 +639,10 @@ func (s *testSessionIncSuite) TestCreateTable(c *C) {
 			session.NewErr(session.ER_TOO_LONG_KEY, "uq_1", indexMaxLength))
 
 		sql = "create table test_error_code_3(c1 int primary key,c2 varchar(255),c3 int, key uq_1(c2,c3)) default charset utf8;"
-		s.testErrorCode(c, sql,
-			session.NewErr(session.ER_TOO_LONG_KEY, "uq_1", indexMaxLength))
+		s.testErrorCode(c, sql)
 
 		sql = "create table test_error_code_3(c1 int primary key,c2 varchar(254),c3 int, key uq_1(c2,c3)) default charset utf8;"
-		s.testErrorCode(c, sql,
-			session.NewErr(session.ER_TOO_LONG_KEY, "uq_1", indexMaxLength))
+		s.testErrorCode(c, sql)
 	}
 
 	// sql = "create table test_error_code_3(c1 int,c2 text, unique uq_1(c1,c2(3068)));"
@@ -691,11 +689,11 @@ primary key(id)) comment 'test';`
 	s.testErrorCode(c, sql)
 
 	// 5.7版本新增计算列
+	config.GetGlobalConfig().Inc.EnableJsonType = true
 	if s.DBVersion >= 50700 {
 		sql = `CREATE TABLE t1(c1 json DEFAULT '{}' COMMENT '日志记录',
 	  type tinyint(10) GENERATED ALWAYS AS (json_extract(operate_info, '$.type')) VIRTUAL COMMENT '操作类型')
 	  ENGINE = InnoDB DEFAULT CHARSET = utf8 COMMENT ='xxx';`
-		config.GetGlobalConfig().Inc.EnableJsonType = true
 		s.testErrorCode(c, sql,
 			session.NewErr(session.ER_BLOB_CANT_HAVE_DEFAULT, "c1"))
 
@@ -1561,7 +1559,7 @@ func (s *testSessionIncSuite) TestUpdate(c *C) {
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_TABLE_NOT_EXISTED_ERROR, "test_inc.t1"))
 
-	sql = "create table t1(id int);update t1 as tmp set tmp.id = 1;"
+	sql = "create table t1(id int);update t1 set id = 1;"
 	s.testErrorCode(c, sql)
 
 	sql = "create table t1(id int);update t1 as tmp set t1.id = 1;"
@@ -2859,4 +2857,52 @@ func (s *testSessionIncSuite) TestBlobAndText(c *C) {
 		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c3"),
 		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "c4"))
 
+}
+
+func (s *testSessionIncSuite) TestWhereCondition(c *C) {
+	sql := ""
+	s.mustRunExec(c, "drop table if exists t1,t2;create table t1(id int);")
+
+	sql = "update t1 set id = 1 where 123;"
+	config.GetGlobalConfig().IncLevel.ErrUseValueExpr = 0
+	s.testErrorCode(c, sql)
+
+	config.GetGlobalConfig().IncLevel.ErrUseValueExpr = 1
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ErrUseValueExpr))
+
+	sql = "update t1 set id = 1 where null;"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ErrUseValueExpr))
+
+	sql = `
+	update t1 set id = 1 where 1+2;
+	update t1 set id = 1 where 1-2;
+	update t1 set id = 1 where 1*2;
+	delete from t1 where 1/2;
+	delete from t1 where 1&2;
+	delete from t1 where 1|2;
+	delete from t1 where 1^2;
+	delete from t1 where 1 div 2;
+	`
+	s.testSQLError(c, sql,
+		session.NewErr(session.ErrUseValueExpr),
+		session.NewErr(session.ErrUseValueExpr),
+		session.NewErr(session.ErrUseValueExpr),
+		session.NewErr(session.ErrUseValueExpr),
+		session.NewErr(session.ErrUseValueExpr),
+		session.NewErr(session.ErrUseValueExpr),
+		session.NewErr(session.ErrUseValueExpr),
+		session.NewErr(session.ErrUseValueExpr),
+	)
+
+	sql = `
+	update t1 set id = 1 where 1+2=3;
+	update t1 set id = 1 where id is null;
+	update t1 set id = 1 where id is not null;
+	update t1 set id = 1 where 1=1;
+	update t1 set id = 1 where id in (1,2);
+	update t1 set id = 1 where id is true;
+	`
+	s.testSQLError(c, sql)
 }
