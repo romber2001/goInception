@@ -177,6 +177,8 @@ const (
 	ER_CANT_SET_ENGINE
 	ER_MUST_AT_LEAST_ONE_COLUMN
 	ER_MUST_HAVE_COLUMNS
+	ErrColumnsMustHaveIndex
+	ErrColumnsMustHaveIndexTypeErr
 	ER_PRIMARY_CANT_HAVE_NULL
 	ErrCantRemoveAllFields
 	ErrNotFoundTableInfo
@@ -224,7 +226,7 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_BAD_FIELD_ERROR:                     "Unknown column '%s' in '%s'.",
 	ER_FIELD_SPECIFIED_TWICE:               "Column '%s' specified twice in table '%s'.",
 	ER_BAD_NULL_ERROR:                      "Column '%s' cannot be null in %d row.",
-	ER_NO_WHERE_CONDITION:                  "set the where condition for select statement.",
+	ER_NO_WHERE_CONDITION:                  "Please set the where condition.",
 	ER_NORMAL_SHUTDOWN:                     "%s: Normal shutdown\n",
 	ER_FORCING_CLOSE:                       "%s: Forcing close of thread %ld  user: '%s'\n",
 	ER_CON_COUNT_ERROR:                     "Too many connections",
@@ -298,7 +300,7 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_END_WITH_COMMIT:                     "Must end with commit.",
 	ER_DB_NOT_EXISTED_ERROR:                "Selected Database '%s' not existed.",
 	ER_TABLE_EXISTS_ERROR:                  "Table '%s' already exists.",
-	ER_INDEX_NAME_IDX_PREFIX:               "Index '%s' in table '%s' need 'idx_' prefix.",
+	ER_INDEX_NAME_IDX_PREFIX:               "Index '%s' in table '%s' need '%s' prefix.",
 	ER_INDEX_NAME_UNIQ_PREFIX:              "Index '%s' in table '%s' need 'uniq_' prefix.",
 	ER_AUTOINC_UNSIGNED:                    "Set unsigned attribute on auto increment column in table '%s'.",
 	ER_VARCHAR_TO_TEXT_LEN:                 "Set column '%s' to TEXT type.",
@@ -348,6 +350,8 @@ var ErrorsDefault = map[ErrorCode]string{
 	ER_CANT_SET_ENGINE:                     "Cannot set engine '%s'",
 	ER_MUST_AT_LEAST_ONE_COLUMN:            "A table must have at least 1 column.",
 	ER_MUST_HAVE_COLUMNS:                   "Must have the specified column: '%s'.",
+	ErrColumnsMustHaveIndex:                "The specified column: '%s' must have index.",
+	ErrColumnsMustHaveIndexTypeErr:         "The specified column: '%s' type must be '%s',current is '%s'.",
 	ER_PRIMARY_CANT_HAVE_NULL:              "All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, use UNIQUE instead",
 	ErrCantRemoveAllFields:                 "You can't delete all columns with ALTER TABLE; use DROP TABLE instead",
 	ErrNotFoundTableInfo:                   "Skip backup because there is no table structure information.",
@@ -395,7 +399,7 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_BAD_FIELD_ERROR:                  "Unknown column '%s' in '%s'.",
 	ER_FIELD_SPECIFIED_TWICE:            "列 '%s' 指定重复(表 '%s').",
 	ER_BAD_NULL_ERROR:                   "列 '%s' 不能为null(第 %d 行).",
-	ER_NO_WHERE_CONDITION:               "selete语句请指定where条件.",
+	ER_NO_WHERE_CONDITION:               "请指定where条件.",
 	ER_NORMAL_SHUTDOWN:                  "%s: Normal shutdown\n",
 	ER_FORCING_CLOSE:                    "%s: Forcing close of thread %ld  user: '%s'\n",
 	ER_CON_COUNT_ERROR:                  "Too many connections",
@@ -519,6 +523,8 @@ var ErrorsChinese = map[ErrorCode]string{
 	ER_CANT_SET_ENGINE:                     "禁止指定存储引擎:'%s'",
 	ER_MUST_AT_LEAST_ONE_COLUMN:            "表至少需要有一个列.",
 	ER_MUST_HAVE_COLUMNS:                   "表必须包含以下列: '%s'.",
+	ErrColumnsMustHaveIndex:                "列: '%s' 必须建索引.",
+	ErrColumnsMustHaveIndexTypeErr:         "列: '%s' 类型必须为 '%s',当前为 '%s'",
 	ER_PRIMARY_CANT_HAVE_NULL:              "主键的所有列必须为NOT NULL,如需要NULL列,请改用唯一索引",
 	ErrCantRemoveAllFields:                 "禁止删除表的所有列.",
 	ErrNotFoundTableInfo:                   "没有表结构信息,跳过备份.",
@@ -567,6 +573,8 @@ func GetErrorLevel(code ErrorCode) uint8 {
 		ER_INVALID_DATA_TYPE,
 		ER_INVALID_IDENT,
 		ER_MUST_HAVE_COLUMNS,
+		ErrColumnsMustHaveIndex,
+		ErrColumnsMustHaveIndexTypeErr,
 		ER_NO_WHERE_CONDITION,
 		ErrJoinNoOnCondition,
 		ER_NOT_ALLOWED_NULLABLE,
@@ -669,7 +677,7 @@ func GetErrorLevel(code ErrorCode) uint8 {
 
 // GetErrorMessage 获取审核信息,默认为英文
 func GetErrorMessage(code ErrorCode, lang string) string {
-	if lang == "zh_cn" {
+	if lang == "zh_cn" || lang == "zh-cn" {
 		if v, ok := ErrorsChinese[code]; ok {
 			return v
 		}
@@ -983,6 +991,10 @@ func (e ErrorCode) String() string {
 		return "er_must_at_least_one_column"
 	case ER_MUST_HAVE_COLUMNS:
 		return "er_must_have_columns"
+	case ErrColumnsMustHaveIndex:
+		return "er_columns_must_have_index"
+	case ErrColumnsMustHaveIndexTypeErr:
+		return "er_columns_must_have_index_type_err"
 	case ER_PRIMARY_CANT_HAVE_NULL:
 		return "er_primary_cant_have_null"
 	case ErrCantRemoveAllFields:
@@ -1035,9 +1047,8 @@ func (e ErrorCode) String() string {
 	return ""
 }
 
-// CheckAuditSetting 自动校准旧的审核规则和自定义规则
-func CheckAuditSetting(cnf *config.Config) {
-	return
+// TestCheckAuditSetting 自动校准旧的审核规则和自定义规则
+func TestCheckAuditSetting(cnf *config.Config) {
 
 	if cnf.Inc.CheckInsertField {
 		cnf.IncLevel.ER_WITH_INSERT_FIELD = int8(GetErrorLevel(ER_WITH_INSERT_FIELD))
@@ -1226,9 +1237,9 @@ func CheckAuditSetting(cnf *config.Config) {
 	}
 
 	if cnf.Inc.EnableChangeColumn {
-		cnf.IncLevel.ErCantChangeColumn = int8(GetErrorLevel(ErCantChangeColumn))
-	} else {
 		cnf.IncLevel.ErCantChangeColumn = 0
+	} else {
+		cnf.IncLevel.ErCantChangeColumn = int8(GetErrorLevel(ErCantChangeColumn))
 	}
 
 	if !cnf.Inc.EnableBlobNotNull {

@@ -36,7 +36,6 @@ import (
 	"github.com/hanchuanchuan/goInception/meta"
 	"github.com/hanchuanchuan/goInception/model"
 	"github.com/hanchuanchuan/goInception/mysql"
-	"github.com/hanchuanchuan/goInception/owner"
 	"github.com/hanchuanchuan/goInception/parser"
 	plannercore "github.com/hanchuanchuan/goInception/planner/core"
 	"github.com/hanchuanchuan/goInception/privilege"
@@ -59,7 +58,6 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tipb/go-binlog"
 	log "github.com/sirupsen/logrus"
-	"go.uber.org/zap"
 	"golang.org/x/net/context"
 
 	"github.com/jinzhu/gorm"
@@ -96,12 +94,12 @@ type Session interface {
 	// FieldList returns fields list of a table.
 	FieldList(tableName string) (fields []*ast.ResultField, err error)
 
-	// HaveBegin() bool
-	// HaveCommit() bool
-	// RecordSets() *MyRecordSets
-
 	// 用以测试
 	GetAlterTablePostPart(sql string, isPtOSC bool) string
+
+	LoadOptions(opt SourceOptions) error
+	Audit(ctx context.Context, sql string) ([]Record, error)
+	RunExecute(ctx context.Context, sql string) ([]Record, error)
 }
 
 var (
@@ -156,20 +154,23 @@ type session struct {
 	sessionManager util.SessionManager
 
 	statsCollector *statistics.SessionStatsCollector
-	// ddlOwnerChecker is used in `select tidb_is_ddl_owner()` statement;
-	ddlOwnerChecker owner.DDLOwnerChecker
 
 	haveBegin  bool
 	haveCommit bool
+	// 标识API请求
+	isAPI bool
 
 	recordSets *MyRecordSets
 
-	opt *sourceOptions
+	opt *SourceOptions
 
 	db       *gorm.DB
 	backupdb *gorm.DB
 
-	DBName string
+	// 执行DDL操作的数据库连接. 仅用于事务功能
+	ddlDB *gorm.DB
+
+	dbName string
 
 	myRecord *Record
 
@@ -181,12 +182,12 @@ type session struct {
 	// 备份库中的备份表
 	backupTableCacheList map[string]bool
 
-	Inc   config.Inc
-	Osc   config.Osc
-	Ghost config.Ghost
+	inc   config.Inc
+	osc   config.Osc
+	ghost config.Ghost
 
 	// 异步备份的通道
-	ch chan *ChanData
+	ch chan *chanData
 
 	// 批量写入表$_$Inception_backup_information$_$
 	chBackupRecord chan *chanBackup
@@ -201,13 +202,13 @@ type session struct {
 	lastBackupTable string
 
 	// 总的操作行数,当备份时用以计算备份进度
-	TotalChangeRows int
-	BackupTotalRows int
+	totalChangeRows int
+	backupTotalRows int
 
 	// 数据库类型
-	DBType int
+	dbType int
 	// 数据库版本号
-	DBVersion int
+	dbVersion int
 
 	// 远程数据库线程ID,在启用备份功能时,用以记录线程ID来解析binlog
 	threadID uint32
@@ -242,14 +243,9 @@ type session struct {
 	// 目标数据库的innodb_large_prefix设置
 	innodbLargePrefix bool
 	// 目标数据库的lower-case-table-names设置, 默认值为1,即不区分大小写
-	LowerCaseTableNames int
+	lowerCaseTableNames int
 	// PXC集群节点
-	IsClusterNode bool
-}
-
-// DDLOwnerChecker returns s.ddlOwnerChecker.
-func (s *session) DDLOwnerChecker() owner.DDLOwnerChecker {
-	return s.ddlOwnerChecker
+	isClusterNode bool
 }
 
 func (s *session) getMembufCap() int {
@@ -680,7 +676,7 @@ func (s *session) ExecRestrictedSQLWithSnapshot(sctx sessionctx.Context, sql str
 		}
 		defer func() {
 			if err := se.sessionVars.SetSystemVar(variable.TiDBSnapshot, ""); err != nil {
-				log.Error("set tidbSnapshot error", zap.Error(err))
+				log.Error("set tidbSnapshot error", err)
 			}
 		}()
 	}
@@ -1326,22 +1322,10 @@ func createSession(store kv.Storage) (*session, error) {
 		return nil, errors.Trace(err)
 	}
 	s := &session{
-		store:           store,
-		parser:          parser.New(),
-		sessionVars:     variable.NewSessionVars(),
-		ddlOwnerChecker: dom.DDL().OwnerManager(),
-
-		LowerCaseTableNames: 1,
-		// haveBegin:  false,
-		// haveCommit: false,
-
-		// tableCacheList: make(map[string]*TableInfo),
-		// dbCacheList:    make(map[string]bool),
-
-		// backupDBCacheList:    make(map[string]bool),
-		// backupTableCacheList: make(map[string]bool),
-
-		// Inc: config.GetGlobalConfig().Inc,
+		store:               store,
+		parser:              parser.New(),
+		sessionVars:         variable.NewSessionVars(),
+		lowerCaseTableNames: 1,
 	}
 
 	if plannercore.PreparedPlanCacheEnabled() {

@@ -1,4 +1,4 @@
-PROJECT=tidb
+PROJECT=goInception
 GOPATH ?= $(shell go env GOPATH)
 
 # Ensure GOPATH is set before running build process.
@@ -16,6 +16,8 @@ GOBUILD   := CGO_ENABLED=0 $(GO) build $(BUILD_FLAG)
 
 VERSION := $(shell git describe --tags --dirty)
 
+VERSION_EASY := $(shell git describe --tags)
+
 # 指定部分单元测试跳过
 ifeq ("$(SHORT)", "1")
 	GOTEST    := CGO_ENABLED=1 $(GO) test -p 3 -short
@@ -32,7 +34,7 @@ MAC       := "Darwin"
 PACKAGE_LIST  := go list ./...| grep -vE "vendor"
 PACKAGES  := $$($(PACKAGE_LIST))
 PACKAGE_DIRECTORIES := $(PACKAGE_LIST) | sed 's|github.com/hanchuanchuan/$(PROJECT)/||'
-FILES     := $$(find $$($(PACKAGE_DIRECTORIES)) -name "*.go" | grep -vE "vendor")
+FILES     := $$(find $$($(PACKAGE_DIRECTORIES)) -name "*.go")
 
 GOFAIL_ENABLE  := $$(find $$PWD/ -type d | grep -vE "(\.git|vendor)" | xargs gofail enable)
 GOFAIL_DISABLE := $$(find $$PWD/ -type d | grep -vE "(\.git|vendor)" | xargs gofail disable)
@@ -49,7 +51,7 @@ CHECK_LDFLAGS += $(LDFLAGS) ${TEST_LDFLAGS}
 
 TARGET = ""
 
-.PHONY: all build update parser clean todo test gotest interpreter server dev benchkv benchraw check parserlib checklist
+.PHONY: all build update parser clean todo test gotest interpreter server dev benchkv benchraw check parserlib checklist testapi
 
 default: server buildsucc
 
@@ -90,10 +92,10 @@ parserlib: parser/parser.go
 parser/parser.go: parser/parser.y
 	make parser
 
-# The retool tools.json is setup from hack/retool-install.sh
-check-setup:
-	@which retool >/dev/null 2>&1 || go get github.com/twitchtv/retool
-	@retool sync
+# Install the check tools.
+check-setup:tools/bin/revive tools/bin/goword tools/bin/gometalinter tools/bin/gosec
+# @which retool >/dev/null 2>&1 || go get github.com/twitchtv/retool
+# @retool sync
 
 check: check-setup fmt lint vet
 
@@ -102,10 +104,11 @@ check-fail: goword check-static check-slow
 
 fmt:
 	@echo "gofmt (simplify)"
-	@gofmt -s -l -w $(FILES) 2>&1 | grep -v "vendor|parser/parser.go" | $(FAIL_ON_STDOUT)
+	@gofmt -s -l -w $(FILES) 2>&1 | $(FAIL_ON_STDOUT)
 
-goword:
-	retool do goword $(FILES) 2>&1 | $(FAIL_ON_STDOUT)
+
+goword:tools/bin/goword
+	tools/bin/goword $(FILES) 2>&1 | $(FAIL_ON_STDOUT)
 
 check-static:
 	@ # vet and fmt have problems with vendor when ran through metalinter
@@ -121,13 +124,13 @@ check-slow:
 	  $$($(PACKAGE_DIRECTORIES))
 	CGO_ENABLED=0 retool do gosec $$($(PACKAGE_DIRECTORIES))
 
-lint:
+lint:tools/bin/revive
 	@echo "linting"
-	@CGO_ENABLED=0 retool do revive -formatter friendly -config revive.toml $(PACKAGES)
+	@tools/bin/revive -formatter friendly -config tools/check/revive.toml ./...
 
 vet:
 	@echo "vet"
-	@go vet -all -shadow $(PACKAGES) 2>&1 | $(FAIL_ON_STDOUT)
+	$(GO) vet -all $(PACKAGES) 2>&1 | $(FAIL_ON_STDOUT)
 
 clean:
 	$(GO) clean -i ./...
@@ -157,11 +160,25 @@ ifeq ("$(TRAVIS_COVERAGE)", "1")
 
 	$(OVERALLS) -project=github.com/hanchuanchuan/goInception -covermode=count -ignore='.git,vendor,cmd,docs,LICENSES' -concurrency=1 -- -short || { $(GOFAIL_DISABLE); exit 1; }
 else
+
+ifeq ("$(API)", "1")
+	@echo "Running in native mode (API)."
+	@export log_level=error;
+	$(GOTEST) -timeout 30m -ldflags '$(TEST_LDFLAGS)' github.com/hanchuanchuan/goInception/session -api
+else
 	@echo "Running in native mode."
-	@export log_level=error; \
+	@export log_level=error;
 	$(GOTEST) -timeout 30m -ldflags '$(TEST_LDFLAGS)' -cover $(PACKAGES) || { $(GOFAIL_DISABLE); exit 1; }
 endif
+
+endif
 	@$(GOFAIL_DISABLE)
+
+testapi: parserlib
+	@echo "Running in native mode (API)."
+	@export log_level=error;
+	$(GOTEST) -timeout 30m -ldflags '$(TEST_LDFLAGS)' github.com/hanchuanchuan/goInception/session -api
+
 
 race: parserlib
 	$(GO) get github.com/etcd-io/gofail@v0.0.0-20180808172546-51ce9a71510a
@@ -249,6 +266,21 @@ ifeq ("$(TRAVIS_COVERAGE)", "1")
 	bash <(curl -s https://codecov.io/bash)
 endif
 
+tools/bin/revive: tools/check/go.mod
+	cd tools/check; \
+	$(GO) build -o ../bin/revive github.com/mgechev/revive
+
+tools/bin/goword: tools/check/go.mod
+	cd tools/check; \
+	$(GO) build -o ../bin/goword github.com/chzchzchz/goword
+
+tools/bin/gometalinter: tools/check/go.mod
+	cd tools/check; \
+	$(GO) build -o ../bin/gometalinter gopkg.in/alecthomas/gometalinter.v3
+
+tools/bin/gosec: tools/check/go.mod
+	cd tools/check; \
+	$(GO) build -o ../bin/gosec github.com/securego/gosec/cmd/gosec
 
 # 	windows无法build,github.com/outbrain/golib有引用syslog.Writer,其在windows未实现.
 .PHONY: release
@@ -260,6 +292,19 @@ release:
 			echo "Building $${GOOS}-$${GOARCH} ..."; \
 			GOOS=$${GOOS} GOARCH=amd64 $(GOBUILD) -ldflags '-s -w $(LDFLAGS)'  -o goInception tidb-server/main.go; \
 			tar -czf release/goInception-$${GOOS}-amd64-${VERSION}.tar.gz goInception config/config.toml.default; \
+			rm -f goInception; \
+		done ;\
+	done
+
+.PHONY: release
+release2:
+	@echo "$(CGREEN)Cross platform building for release ...$(CEND)"
+	@mkdir -p release
+	@for GOOS in darwin linux; do \
+		for GOARCH in amd64; do \
+			echo "Building $${GOOS}-$${GOARCH} ..."; \
+			GOOS=$${GOOS} GOARCH=amd64 $(GOBUILD) -ldflags '-s -w $(LDFLAGS)'  -o goInception tidb-server/main.go; \
+			tar -czf release/goInception-$${GOOS}-amd64-${VERSION_EASY}.tar.gz goInception config/config.toml.default; \
 			rm -f goInception; \
 		done ;\
 	done
@@ -278,3 +323,4 @@ docker:
 docker-push:
 	v1=$(shell git tag|tail -1) && docker push hanchuanchuan/goinception:$${v1} \
 	&& docker push hanchuanchuan/goinception:latest
+

@@ -50,6 +50,9 @@ compatible-kill-query = false
 
 skip_grant_table = true
 
+# 忽略终端连接断开信号
+ignore_sighup = true
+
 [log]
 # Log level: debug, info, warn, error, fatal.
 level = "info"
@@ -167,57 +170,6 @@ header-timeout = 5
 enabled = false
 capacity = 100
 
-[opentracing]
-# Enable opentracing.
-enable = false
-
-# Whether to enable the rpc metrics.
-rpc-metrics = false
-
-[opentracing.sampler]
-# Type specifies the type of the sampler: const, probabilistic, rateLimiting, or remote
-type = "const"
-
-# Param is a value passed to the sampler.
-# Valid values for Param field are:
-# - for "const" sampler, 0 or 1 for always false/true respectively
-# - for "probabilistic" sampler, a probability between 0 and 1
-# - for "rateLimiting" sampler, the number of spans per second
-# - for "remote" sampler, param is the same as for "probabilistic"
-# and indicates the initial sampling rate before the actual one
-# is received from the mothership
-param = 1.0
-
-# SamplingServerURL is the address of jaeger-agent's HTTP sampling server
-sampling-server-url = ""
-
-# MaxOperations is the maximum number of operations that the sampler
-# will keep track of. If an operation is not tracked, a default probabilistic
-# sampler will be used rather than the per operation specific sampler.
-max-operations = 0
-
-# SamplingRefreshInterval controls how often the remotely controlled sampler will poll
-# jaeger-agent for the appropriate sampling strategy.
-sampling-refresh-interval = 0
-
-[opentracing.reporter]
-# QueueSize controls how many spans the reporter can keep in memory before it starts dropping
-# new spans. The queue is continuously drained by a background go-routine, as fast as spans
-# can be sent out of process.
-queue-size = 0
-
-# BufferFlushInterval controls how often the buffer is force-flushed, even if it's not full.
-# It is generally not useful, as it only matters for very low traffic services.
-buffer-flush-interval = 0
-
-# LogSpans, when true, enables LoggingReporter that runs in parallel with the main reporter
-# and logs all submitted spans. Main Configuration.Logger must be initialized in the code
-# for this option to have any effect.
-log-spans = false
-
-#  LocalAgentHostPort instructs reporter to send spans to jaeger-agent at this address
-local-agent-host-port = ""
-
 [tikv-client]
 # Max gRPC connections that will be established with each tikv-server.
 grpc-connection-count = 16
@@ -286,6 +238,11 @@ explain_rule = "first"
 # 1  表示开启安全更新
 sql_safe_updates = -1
 
+# 设置执行SQL时，会话变量
+# -1 表示不做操作，基于远端数据库【默认值】
+# > 0 值表示，会话在执行SQL 时获取锁超时的时间
+lock_wait_timeout = -1
+
 skip_grant_table = true
 
 support_charset = "utf8,utf8mb4"
@@ -327,6 +284,8 @@ er_invalid_ident = 1
 er_join_no_on_condition = 1
 er_json_type_support = 2
 er_must_have_columns = 1
+er_columns_must_have_index = 1
+er_columns_must_have_index_type_err = 1
 er_no_where_condition = 1
 er_not_allowed_nullable = 1
 er_ordery_by_rand = 1
@@ -389,6 +348,9 @@ osc_max_lag = 3
 
 # 类似--max-lag，检查集群暂停流量控制所花费的平均时间（仅适用于PXC 5.6及以上版本,会自动检测)
 osc_max_flow_ctl = -1
+
+# 对应参数pt-online-schema-change中的参数 --set-vars lock_wait_timeout=?
+osc_lock_wait_timeout = 60
 
 # 对应参数pt-online-schema-change中的参数--[no]check-alter。默认值：ON
 osc_check_alter = true

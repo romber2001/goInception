@@ -184,7 +184,7 @@ update t1 set c1='10' where id>0;`, 2)
 	)
 
 	// 测试不同分批下的大量数据
-	s.insertMulti(c, 2)
+	s.insertMulti(c, 7)
 	s.insertMulti(c, 79)
 
 	// for i := 41; i <= 60; i++ {
@@ -442,5 +442,58 @@ func (s *testSessionIncTranSuite) TestDelete(c *C) {
 	row = res.Rows()[int(s.tk.Se.AffectedRows())-1]
 	backup = s.query("t1", row[7].(string))
 	c.Assert(backup, Equals, "INSERT INTO `test_inc`.`t1`(`id`,`c1`) VALUES(1,'😁😄🙂👩');", Commentf("%v", res.Rows()))
+
+}
+
+func (s *testSessionIncTranSuite) TestCreateTable(c *C) {
+	saved := config.GetGlobalConfig().Inc
+	defer func() {
+		config.GetGlobalConfig().Inc = saved
+	}()
+
+	var (
+		res *testkit.Result
+		// row    []interface{}
+		// backup string
+	)
+
+	res = s.mustRunBackupTran(c, `DROP TABLE IF EXISTS t1,t2;
+
+	CREATE TABLE t1 (id int(11) NOT NULL,
+		c1 int(11) DEFAULT NULL,
+		c2 int(11) DEFAULT NULL,
+		PRIMARY KEY (id));
+
+	INSERT INTO t1 VALUES (1, 1, 1);
+
+	CREATE TABLE t2 (id int(11) NOT NULL,
+		c1 int(11) DEFAULT NULL,
+		c2 int(11) DEFAULT NULL,
+		PRIMARY KEY (id))`)
+	s.assertRows(c, res.Rows()[2:],
+		"DROP TABLE `test_inc`.`t1`;",
+		"DELETE FROM `test_inc`.`t1` WHERE `id`=1;",
+		"DROP TABLE `test_inc`.`t2`;")
+
+	res = s.mustRunBackupTran(c, `DROP TABLE IF EXISTS t1,t2;
+		create table t1(id int primary key,c1 int);
+		insert into t1 values(1,1),(2,2);
+		delete from t1 where id=1;
+		alter table t1 add column c2 int;
+		insert into t1 values(3,3,3);
+		delete from t1 where id>0;
+		create table t2(id int primary key,c1 int);
+		insert into t2 values(3,3);`)
+	s.assertRows(c, res.Rows()[2:],
+		"DROP TABLE `test_inc`.`t1`;",
+		"DELETE FROM `test_inc`.`t1` WHERE `id`=1;",
+		"DELETE FROM `test_inc`.`t1` WHERE `id`=2;",
+		"INSERT INTO `test_inc`.`t1`(`id`,`c1`) VALUES(1,1);",
+		"ALTER TABLE `test_inc`.`t1` DROP COLUMN `c2`;",
+		"DELETE FROM `test_inc`.`t1` WHERE `id`=3;",
+		"INSERT INTO `test_inc`.`t1`(`id`,`c1`,`c2`) VALUES(2,2,NULL);",
+		"INSERT INTO `test_inc`.`t1`(`id`,`c1`,`c2`) VALUES(3,3,3);",
+		"DROP TABLE `test_inc`.`t2`;",
+		"DELETE FROM `test_inc`.`t2` WHERE `id`=3;")
 
 }

@@ -14,7 +14,9 @@ goInception是一个集审核、执行、备份及生成回滚语句于一身的
 
 **[使用文档](https://hanchuanchuan.github.io/goInception/)**
 
-**[更新日志](https://github.com/hanchuanchuan/goInception/blob/master/docs/changelog.md)**
+**[使用文档-备用-国内](https://docs.goinception.com/)**
+
+**[更新日志](https://github.com/hanchuanchuan/inc-docs/blob/master/changelog.md)**
 
 
 ### 安装说明
@@ -52,7 +54,7 @@ docker pull hanchuanchuan/goinception
 - [TiDB](https://github.com/pingcap/tidb)
 
 #### 赞助&定制
-- [赞助与支持](https://hanchuanchuan.github.io/goInception/support/)
+- [赞助与支持](https://hanchuanchuan.github.io/goInception/support.html)
 
 #### 交流
 

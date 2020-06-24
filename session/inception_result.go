@@ -15,6 +15,7 @@ package session
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 
 	"github.com/hanchuanchuan/goInception/ast"
@@ -24,6 +25,7 @@ import (
 	"github.com/hanchuanchuan/goInception/types/json"
 	"github.com/hanchuanchuan/goInception/util/chunk"
 	"github.com/hanchuanchuan/goInception/util/sqlexec"
+
 	// log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
@@ -94,6 +96,91 @@ type Record struct {
 	// update多表时,默认set第一列的表为主表,其余表才会记录到该处
 	// 仅在发现多表操作时,初始化该参数
 	MultiTables map[string]*TableInfo
+}
+
+func (r *Record) appendErrorMessage(msg string) {
+	r.ErrLevel = 2
+
+	r.Buf.WriteString(msg)
+	if !strings.HasSuffix(msg, ".") && !strings.HasSuffix(msg, "!") {
+		r.Buf.WriteString(".")
+	}
+	r.Buf.WriteString("\n")
+}
+
+func (r *Record) appendErrorNo(lang string, number ErrorCode, values ...interface{}) {
+	r.ErrLevel = uint8(Max(int(r.ErrLevel), int(GetErrorLevel(number))))
+
+	if len(values) == 0 {
+		r.Buf.WriteString(GetErrorMessage(number, lang))
+	} else {
+		r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number, lang), values...))
+	}
+	r.Buf.WriteString("\n")
+}
+
+// appendWarning 添加警告. 错误级别指定为警告
+func (r *Record) appendWarning(lang string, number ErrorCode, values ...interface{}) {
+	r.ErrLevel = uint8(Max(int(r.ErrLevel), 1))
+
+	if len(values) == 0 {
+		r.Buf.WriteString(GetErrorMessage(number, lang))
+	} else {
+		r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number, lang), values...))
+	}
+	r.Buf.WriteString("\n")
+}
+
+// cut 清理无须返回的字段
+func (r *Record) cut() {
+	if r.ErrorMessage == "" {
+		r.ErrorMessage = strings.TrimSpace(r.Buf.String())
+	}
+	r.Buf = nil
+	r.Type = nil
+	r.TableInfo = nil
+	r.MultiTables = nil
+}
+
+func (r *Record) List() []interface{} {
+
+	columns := make([]interface{}, 12)
+
+	columns[0] = r.SeqNo
+
+	columns[1] = StageList[r.Stage]
+	columns[2] = int64(r.ErrLevel)
+	columns[3] = StatusList[r.StageStatus]
+
+	columns[4] = r.ErrorMessage
+
+	columns[5] = r.Sql
+	columns[6] = int64(r.AffectedRows)
+
+	if r.OPID == "" {
+		columns[7] = makeOPIDByTime(r.ExecTimestamp,
+			r.ThreadId, r.SeqNo)
+	} else {
+		columns[7] = r.OPID
+	}
+
+	columns[8] = r.BackupDBName
+
+	if r.ExecTime == "" {
+		columns[9] = "0"
+	} else {
+		columns[9] = r.ExecTime
+	}
+
+	columns[10] = r.Sqlsha1
+
+	if r.BackupCostTime == "" {
+		columns[11] = "0"
+	} else {
+		columns[11] = r.BackupCostTime
+	}
+
+	return columns
 }
 
 type recordSet struct {
@@ -238,9 +325,9 @@ func (s *MyRecordSets) setFields(r *Record) {
 
 	row[0].SetInt64(int64(s.rc.count + 1))
 
-	row[1].SetString(stageList[r.Stage])
+	row[1].SetString(StageList[r.Stage])
 	row[2].SetInt64(int64(r.ErrLevel))
-	row[3].SetString(statusList[r.StageStatus])
+	row[3].SetString(StatusList[r.StageStatus])
 
 	if r.ErrorMessage != "" {
 		row[4].SetString(r.ErrorMessage)

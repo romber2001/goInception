@@ -20,13 +20,11 @@ import (
 
 	// "fmt"
 	"io/ioutil"
-	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/hanchuanchuan/goInception/mysql"
 	"github.com/hanchuanchuan/goInception/util/logutil"
 	"github.com/pingcap/errors"
-	tracing "github.com/uber/jaeger-client-go/config"
 )
 
 // Config number limitations
@@ -71,7 +69,6 @@ type Config struct {
 	Status              Status            `toml:"status" json:"status"`
 	Performance         Performance       `toml:"performance" json:"performance"`
 	PreparedPlanCache   PreparedPlanCache `toml:"prepared-plan-cache" json:"prepared-plan-cache"`
-	OpenTracing         OpenTracing       `toml:"opentracing" json:"opentracing"`
 	ProxyProtocol       ProxyProtocol     `toml:"proxy-protocol" json:"proxy-protocol"`
 	TiKVClient          TiKVClient        `toml:"tikv-client" json:"tikv-client"`
 	Binlog              Binlog            `toml:"binlog" json:"binlog"`
@@ -83,6 +80,9 @@ type Config struct {
 
 	// 是否跳过用户权限校验
 	SkipGrantTable bool `toml:"skip_grant_table" json:"skip_grant_table"`
+
+	// 忽略终端连接断开信号
+	IgnoreSighup bool `toml:"ignore_sighup" json:"ignore_sighup"`
 }
 
 // Log is the log section of config.
@@ -96,10 +96,8 @@ type Log struct {
 	// File log config.
 	File logutil.FileLogConfig `toml:"file" json:"file"`
 
-	SlowQueryFile      string `toml:"slow-query-file" json:"slow-query-file"`
-	SlowThreshold      uint   `toml:"slow-threshold" json:"slow-threshold"`
-	ExpensiveThreshold uint   `toml:"expensive-threshold" json:"expensive-threshold"`
-	QueryLogMaxLen     uint   `toml:"query-log-max-len" json:"query-log-max-len"`
+	ExpensiveThreshold uint `toml:"expensive-threshold" json:"expensive-threshold"`
+	QueryLogMaxLen     uint `toml:"query-log-max-len" json:"query-log-max-len"`
 }
 
 // Security is the security section of the config.
@@ -185,33 +183,6 @@ type TxnLocalLatches struct {
 type PreparedPlanCache struct {
 	Enabled  bool `toml:"enabled" json:"enabled"`
 	Capacity uint `toml:"capacity" json:"capacity"`
-}
-
-// OpenTracing is the opentracing section of the config.
-type OpenTracing struct {
-	Enable     bool                `toml:"enable" json:"enbale"`
-	Sampler    OpenTracingSampler  `toml:"sampler" json:"sampler"`
-	Reporter   OpenTracingReporter `toml:"reporter" json:"reporter"`
-	RPCMetrics bool                `toml:"rpc-metrics" json:"rpc-metrics"`
-}
-
-// OpenTracingSampler is the config for opentracing sampler.
-// See https://godoc.org/github.com/uber/jaeger-client-go/config#SamplerConfig
-type OpenTracingSampler struct {
-	Type                    string        `toml:"type" json:"type"`
-	Param                   float64       `toml:"param" json:"param"`
-	SamplingServerURL       string        `toml:"sampling-server-url" json:"sampling-server-url"`
-	MaxOperations           int           `toml:"max-operations" json:"max-operations"`
-	SamplingRefreshInterval time.Duration `toml:"sampling-refresh-interval" json:"sampling-refresh-interval"`
-}
-
-// OpenTracingReporter is the config for opentracing reporter.
-// See https://godoc.org/github.com/uber/jaeger-client-go/config#ReporterConfig
-type OpenTracingReporter struct {
-	QueueSize           int           `toml:"queue-size" json:"queue-size"`
-	BufferFlushInterval time.Duration `toml:"buffer-flush-interval" json:"buffer-flush-interval"`
-	LogSpans            bool          `toml:"log-spans" json:"log-spans"`
-	LocalAgentHostPort  string        `toml:"local-agent-host-port" json:"local-agent-host-port"`
 }
 
 // ProxyProtocol is the PROXY protocol section of the config.
@@ -359,6 +330,8 @@ type Inc struct {
 
 	// 建表必须创建的列. 可指定多个列,以逗号分隔.列类型可选. 格式: 列名 [列类型,可选],...
 	MustHaveColumns string `toml:"must_have_columns" json:"must_have_columns"`
+	// 如果表包含以下列，列必须有索引。可指定多个列,以逗号分隔.列类型可选.   格式: 列名 [列类型,可选],...
+	ColumnsMustHaveIndex string `toml:"columns_must_have_index" json:"columns_must_have_index"`
 
 	// 是否跳过用户权限校验
 	SkipGrantTable bool `toml:"skip_grant_table" json:"skip_grant_table"`
@@ -370,6 +343,11 @@ type Inc struct {
 	// 0  表示关闭安全更新
 	// 1  表示开启安全更新
 	SqlSafeUpdates int `toml:"sql_safe_updates" json:"sql_safe_updates"`
+
+	// 设置执行SQL时，会话变量
+	// 0 表示不做操作，基于远端数据库【默认值】
+	// > 0 值表示，会话在执行SQL 时获取锁超时的时间
+	LockWaitTimeout int `toml:"lock_wait_timeout" json:"lock_wait_timeout"`
 
 	// 支持的字符集
 	SupportCharset string `toml:"support_charset" json:"support_charset"`
@@ -424,6 +402,9 @@ type Osc struct {
 
 	// 对应参数pt-online-schema-change中的参数--[no]check-alter。默认值：ON
 	OscCheckAlter bool `toml:"osc_check_alter" json:"osc_check_alter"`
+
+	// 对应参数pt-online-schema-change中的参数 --set-vars lock_wait_timeout=60s
+	OscLockWaitTimeout int `toml:"osc_lock_wait_timeout" json:"osc_lock_wait_timeout"`
 
 	// 对应参数pt-online-schema-change中的参数--[no]check-replication-filters。默认值：ON
 	OscCheckReplicationFilters bool `toml:"osc_check_replication_filters" json:"osc_check_replication_filters"`
@@ -621,6 +602,8 @@ type IncLevel struct {
 	ER_INVALID_DATA_TYPE            int8 `toml:"er_invalid_data_type"`
 	ER_INVALID_IDENT                int8 `toml:"er_invalid_ident"`
 	ER_MUST_HAVE_COLUMNS            int8 `toml:"er_must_have_columns"`
+	ErrColumnsMustHaveIndex         int8 `toml:"er_columns_must_have_index"`
+	ErrColumnsMustHaveIndexTypeErr  int8 `toml:"er_columns_must_have_index_type_err"`
 	ER_NO_WHERE_CONDITION           int8 `toml:"er_no_where_condition"`
 	ER_NOT_ALLOWED_NULLABLE         int8 `toml:"er_not_allowed_nullable"`
 	ER_ORDERY_BY_RAND               int8 `toml:"er_ordery_by_rand"`
@@ -683,7 +666,6 @@ var defaultConf = Config{
 			LogRotate: true,
 			MaxSize:   logutil.DefaultLogMaxSize,
 		},
-		SlowThreshold:      300,
 		ExpensiveThreshold: 10000,
 		QueryLogMaxLen:     2048,
 	},
@@ -713,14 +695,6 @@ var defaultConf = Config{
 		Enabled:  false,
 		Capacity: 100,
 	},
-	OpenTracing: OpenTracing{
-		Enable: false,
-		Sampler: OpenTracingSampler{
-			Type:  "const",
-			Param: 1.0,
-		},
-		Reporter: OpenTracingReporter{},
-	},
 	TiKVClient: TiKVClient{
 		GrpcConnectionCount:  16,
 		GrpcKeepAliveTime:    10,
@@ -733,6 +707,7 @@ var defaultConf = Config{
 	// 默认跳过权限校验 2019-1-26
 	// 为配置方便,在config节点也添加相同参数
 	SkipGrantTable: true,
+	IgnoreSighup:   true,
 	Security: Security{
 		SkipGrantTable: true,
 	},
@@ -749,6 +724,7 @@ var defaultConf = Config{
 		CheckFloatDouble:      false,
 		CheckIdentifierUpper:  false,
 		SqlSafeUpdates:        -1,
+		LockWaitTimeout:       -1,
 		SupportCharset:        "utf8,utf8mb4",
 		SupportEngine:         "innodb",
 		Lang:                  "en-US",
@@ -778,6 +754,7 @@ var defaultConf = Config{
 		OscRecursionMethod:         "processlist",
 		OscMaxLag:                  3,
 		OscMaxFlowCtl:              -1,
+		OscLockWaitTimeout:         60,
 		OscCheckAlter:              true,
 		OscCheckReplicationFilters: true,
 		OscCheckUniqueKeyChange:    true,
@@ -833,6 +810,8 @@ var defaultConf = Config{
 		ER_INVALID_DATA_TYPE:            1,
 		ER_INVALID_IDENT:                1,
 		ER_MUST_HAVE_COLUMNS:            1,
+		ErrColumnsMustHaveIndex:         1,
+		ErrColumnsMustHaveIndexTypeErr:  1,
 		ER_NO_WHERE_CONDITION:           1,
 		ER_NOT_ALLOWED_NULLABLE:         1,
 		ER_ORDERY_BY_RAND:               1,
@@ -902,29 +881,7 @@ func (l *Log) ToLogConfig() *logutil.LogConfig {
 		Format:           l.Format,
 		DisableTimestamp: l.DisableTimestamp,
 		File:             l.File,
-		SlowQueryFile:    l.SlowQueryFile,
 	}
-}
-
-// ToTracingConfig converts *OpenTracing to *tracing.Configuration.
-func (t *OpenTracing) ToTracingConfig() *tracing.Configuration {
-	ret := &tracing.Configuration{
-		Disabled:   !t.Enable,
-		RPCMetrics: t.RPCMetrics,
-		Reporter:   &tracing.ReporterConfig{},
-		Sampler:    &tracing.SamplerConfig{},
-	}
-	ret.Reporter.QueueSize = t.Reporter.QueueSize
-	ret.Reporter.BufferFlushInterval = t.Reporter.BufferFlushInterval
-	ret.Reporter.LogSpans = t.Reporter.LogSpans
-	ret.Reporter.LocalAgentHostPort = t.Reporter.LocalAgentHostPort
-
-	ret.Sampler.Type = t.Sampler.Type
-	ret.Sampler.Param = t.Sampler.Param
-	ret.Sampler.SamplingServerURL = t.Sampler.SamplingServerURL
-	ret.Sampler.MaxOperations = t.Sampler.MaxOperations
-	ret.Sampler.SamplingRefreshInterval = t.Sampler.SamplingRefreshInterval
-	return ret
 }
 
 func init() {
